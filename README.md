@@ -217,6 +217,28 @@ For safer architecture, split control plane and app plane, add auth, and avoid e
 
 ---
 
+## Clean Room
+
+Use this to fully reset a test host before re-running the deployment steps.
+
+```bash
+# 1) Remove the stack
+docker stack rm clawbucket
+
+# 2) Remove unused containers/networks/images/volumes
+docker system prune -a --volumes -f
+
+# 3) Leave swarm mode (reset node swarm state)
+docker swarm leave --force
+```
+
+Optional: remove local source checkout
+
+```bash
+cd ~
+rm -rf ~/source/clawbucket
+```
+
 ## Remove stack
 
 ```bash
