@@ -1,4 +1,5 @@
 # clawbucket
+<img width="1025" height="381" alt="image" src="https://github.com/user-attachments/assets/9441334c-98f4-400f-9035-b183ca4ff0db" />
 
 **Bob's World** — a tiny visual Docker Swarm dashboard.
 
