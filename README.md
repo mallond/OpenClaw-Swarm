@@ -149,6 +149,24 @@ docker node ls
 
 ---
 
+## Hot Deploy (quick rebuild + rolling update)
+
+Run from manager node:
+
+```bash
+cd ~/source/clawbucket
+git pull
+docker build -t mallond/clawbucket:latest .
+docker push mallond/clawbucket:latest
+docker stack deploy -c docker-stack.yml clawbucket
+```
+
+Watch rollout:
+
+```bash
+docker service ps clawbucket_clawbucket --no-trunc
+```
+
 ## Updating to latest version
 
 ```bash
