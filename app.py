@@ -240,7 +240,26 @@ def index():
     let pendingTarget = null;
     let currentDesired = null;
     let currentRunning = null;
+    let isEditingReplicaInput = false;
 
+
+    replicasInput.addEventListener('focus', () => {
+      isEditingReplicaInput = true;
+    });
+
+    replicasInput.addEventListener('blur', () => {
+      isEditingReplicaInput = false;
+    });
+
+    // Prevent accidental mouse-wheel value changes on number input.
+    replicasInput.addEventListener('wheel', (e) => {
+      e.preventDefault();
+    }, { passive: false });
+
+    // Scaling should happen only by clicking the button.
+    replicasInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') e.preventDefault();
+    });
 
     async function loadState() {
       try {
@@ -253,7 +272,7 @@ def index():
         currentDesired = data.desired_replicas;
         currentRunning = data.running_count;
 
-        if (pendingTarget === null) {
+        if (pendingTarget === null && !isEditingReplicaInput) {
           replicasInput.value = data.desired_replicas;
         }
 
@@ -298,6 +317,10 @@ def index():
 
     applyBtn.addEventListener('click', async () => {
       const replicas = parseInt(replicasInput.value, 10);
+      if (!Number.isInteger(replicas) || replicas < 1 || replicas > 25) {
+        msg.textContent = 'Replicas must be a whole number between 1 and 25';
+        return;
+      }
 
       if (pendingTarget !== null) {
         msg.textContent = `Please wait — scaling to ${pendingTarget} in progress`;
