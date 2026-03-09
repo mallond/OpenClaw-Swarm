@@ -29,6 +29,8 @@ RPS_STATE_KEY = "clawbucket:rps:state"
 RPS_INTERVAL_KEY = "clawbucket:rps:interval_seconds"
 RPS_DEFAULT_INTERVAL_SECONDS = 10
 RPS_TTL_SECONDS = 20
+PLAYER_SCORE_PREFIX = "clawbucket:rps:score:"
+PLAYER_LAST_SEEN_PREFIX = "clawbucket:rps:last_seen:"
 
 
 def color_from_text(text: str) -> str:
@@ -260,6 +262,105 @@ def is_this_task_on_leader_manager() -> bool:
         return False
 
 
+def task_id_for_keys() -> str:
+    return os.environ.get("TASK_ID", "unknown")
+
+
+def score_key(task_id: str) -> str:
+    return f"{PLAYER_SCORE_PREFIX}{task_id}"
+
+
+def last_seen_key(task_id: str) -> str:
+    return f"{PLAYER_LAST_SEEN_PREFIX}{task_id}"
+
+
+def get_task_score(task_id: str) -> int:
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(score_key(task_id))
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return int(raw) if raw is not None else 0
+    except Exception:
+        return 0
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def set_task_score(task_id: str, score: int):
+    client = None
+    try:
+        client = memcache_client()
+        client.set(score_key(task_id), str(int(score)), expire=86400)
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def score_delta(player: str, leader: str) -> int:
+    p = (player or "").lower()
+    l = (leader or "").lower()
+    alias = {"stone": "rock"}
+    p = alias.get(p, p)
+    l = alias.get(l, l)
+    if p == l:
+        return 0
+    wins = {("rock", "scissors"), ("paper", "rock"), ("scissors", "paper")}
+    return 1 if (p, l) in wins else -1
+
+
+def player_round_once():
+    # Only non-leaders are players.
+    if is_this_task_on_leader_manager():
+        return
+
+    state = read_rps_state()
+    if not state:
+        return
+
+    leader_choice = (state.get("choice") or "").lower()
+    round_id = state.get("at") or ""
+    if not leader_choice or not round_id:
+        return
+
+    task_id = task_id_for_keys()
+
+    client = None
+    try:
+        client = memcache_client()
+        prev_seen = client.get(last_seen_key(task_id))
+        if isinstance(prev_seen, bytes):
+            prev_seen = prev_seen.decode("utf-8")
+        if prev_seen == round_id:
+            return
+
+        player_choice = random.choice(["rock", "paper", "scissors"])
+        delta = score_delta(player_choice, leader_choice)
+        current_score = get_task_score(task_id)
+        new_score = current_score + delta
+
+        client.set(score_key(task_id), str(new_score), expire=86400)
+        client.set(last_seen_key(task_id), round_id, expire=86400)
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
 def write_rps_state_once():
     # Light simulation: only the task on Swarm leader-manager node publishes.
     if not is_this_task_on_leader_manager():
@@ -312,6 +413,12 @@ def read_rps_state():
 def rps_loop():
     while True:
         write_rps_state_once()
+        time.sleep(get_rps_interval_seconds())
+
+
+def player_loop():
+    while True:
+        player_round_once()
         time.sleep(get_rps_interval_seconds())
 
 
@@ -379,6 +486,7 @@ def get_service_state():
                     "name": generated_name(task_id),
                     "color": color_from_text(task_id),
                     "is_manager": False,
+                    "score": get_task_score(task_id),
                 }
             )
 
@@ -594,6 +702,14 @@ def index():
       border-radius: 999px;
       padding: 3px 7px;
     }
+    .score {
+      margin-top: 8px;
+      font-size: 1.8rem;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .score.positive { color: #44d27a; }
+    .score.negative { color: #ff6b6b; }
   </style>
 </head>
 <body>
@@ -888,9 +1004,12 @@ def index():
           el.dataset.taskId = r.id;
           el.dataset.botName = r.name;
           el.style.setProperty('--chip-color', r.color);
+          const scoreClass = (r.score || 0) < 0 ? 'negative' : 'positive';
+          const scoreText = (r.score || 0) > 0 ? `+${r.score}` : `${r.score || 0}`;
           el.innerHTML = `
             <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}
             <h3>${r.name}</h3>
+            ${r.is_manager ? '' : `<div class="score ${scoreClass}">${scoreText}</div>`}
             <p><strong>Slot:</strong> ${r.slot}</p>
             <p><strong>Task:</strong> ${r.id.slice(0, 12)}</p>
             <p><strong>Node:</strong> ${r.node_id.slice(0, 12)}</p>
@@ -970,4 +1089,5 @@ def index():
 if __name__ == "__main__":
     Thread(target=heartbeat_loop, daemon=True).start()
     Thread(target=rps_loop, daemon=True).start()
+    Thread(target=player_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
