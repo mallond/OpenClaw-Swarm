@@ -241,9 +241,28 @@ def set_rps_interval_seconds(value: int) -> int:
     return value
 
 
+def is_this_task_on_leader_manager() -> bool:
+    current_node_hostname = os.environ.get("SWARM_NODE") or ""
+    if not current_node_hostname:
+        return False
+
+    try:
+        client = docker_client()
+        leader_hostname = None
+        for node in client.nodes.list():
+            nattrs = node.attrs or {}
+            mstatus = nattrs.get("ManagerStatus") or {}
+            if mstatus.get("Leader") is True:
+                leader_hostname = (nattrs.get("Description") or {}).get("Hostname")
+                break
+        return bool(leader_hostname and leader_hostname == current_node_hostname)
+    except Exception:
+        return False
+
+
 def write_rps_state_once():
-    # Light simulation: slot 1 publishes shared random R/P/S for everyone.
-    if str(os.environ.get("TASK_SLOT", "")) != "1":
+    # Light simulation: only the task on Swarm leader-manager node publishes.
+    if not is_this_task_on_leader_manager():
         return
 
     choice = random.choice(["rock", "paper", "scissors"])
@@ -252,6 +271,7 @@ def write_rps_state_once():
         "choice": choice,
         "from": task_name,
         "at": datetime.now(timezone.utc).isoformat(),
+        "publisher": "leader-manager",
     }
 
     client = None
