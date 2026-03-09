@@ -330,12 +330,14 @@ def get_service_state():
     attrs = service.attrs
     desired = attrs["Spec"]["Mode"]["Replicated"]["Replicas"]
 
-    manager_node_ids = set()
+    leader_node_id = None
     try:
         for node in client.nodes.list():
             nattrs = node.attrs or {}
-            if nattrs.get("ManagerStatus"):
-                manager_node_ids.add(nattrs.get("ID"))
+            mstatus = nattrs.get("ManagerStatus") or {}
+            if mstatus.get("Leader") is True:
+                leader_node_id = nattrs.get("ID")
+                break
     except Exception:
         pass
 
@@ -356,11 +358,24 @@ def get_service_state():
                     "node_id": node_id,
                     "name": generated_name(task_id),
                     "color": color_from_text(task_id),
-                    "is_manager": node_id in manager_node_ids,
+                    "is_manager": False,
                 }
             )
 
     running.sort(key=lambda x: x["slot"])
+
+    # Mark exactly one manager tile, chosen by Swarm leader node and lowest slot.
+    if running:
+        manager_idx = None
+        if leader_node_id:
+            for i, r in enumerate(running):
+                if r["node_id"] == leader_node_id:
+                    manager_idx = i
+                    break
+        if manager_idx is None:
+            manager_idx = 0
+        running[manager_idx]["is_manager"] = True
+
     return {
         "service": SERVICE_NAME,
         "desired_replicas": desired,
