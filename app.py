@@ -196,13 +196,6 @@ def index():
       padding: 12px;
       position: relative;
       overflow: hidden;
-      cursor: pointer;
-      transition: background-color .2s ease, border-color .2s ease, box-shadow .2s ease;
-    }
-    .chip.active {
-      background: #174d2e;
-      border-color: #35a862;
-      box-shadow: inset 0 0 0 1px rgba(83, 214, 134, 0.2);
     }
     .chip::before {
       content: "";
@@ -214,7 +207,20 @@ def index():
     .chip h3 { margin: 4px 0 8px; font-size: 1.02rem; }
     .chip p { margin: 4px 0; color: var(--muted); font-size: .9rem; }
     .status { display: inline-block; font-size: .78rem; font-weight: 700; letter-spacing: .02em; padding: 4px 8px; border-radius: 999px; background: #24314f; }
-    .chip.active .status { background: #2d7c4a; }
+    .arm-btn {
+      margin-top: 8px;
+      border: 1px solid #4d5f8e;
+      background: #1d2746;
+      color: #fff;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .arm-btn.on {
+      background: #2d7c4a;
+      border-color: #3fb96d;
+    }
   </style>
 </head>
 <body>
@@ -276,17 +282,23 @@ def index():
     }
 
     function applyTileVisualState(tileEl, isOn) {
-      tileEl.classList.toggle('active', isOn);
       const badge = tileEl.querySelector('.status');
       if (badge) badge.textContent = isOn ? 'ON' : 'OFF';
+      const armBtn = tileEl.querySelector('.arm-btn');
+      if (armBtn) {
+        armBtn.classList.toggle('on', isOn);
+        armBtn.textContent = isOn ? 'Arm ON' : 'Arm OFF';
+      }
     }
 
     grid.addEventListener('click', (event) => {
-      const tile = event.target.closest('.chip');
-      if (!tile || !grid.contains(tile)) return;
+      const armBtn = event.target.closest('.arm-btn');
+      if (!armBtn || !grid.contains(armBtn)) return;
+      const tile = armBtn.closest('.chip');
+      if (!tile) return;
       const taskId = tile.dataset.taskId;
       if (!taskId) return;
-      const nowOn = !tile.classList.contains('active');
+      const nowOn = !armBtn.classList.contains('on');
       applyTileVisualState(tile, nowOn);
       setTileToggle(taskId, nowOn);
     });
@@ -359,6 +371,7 @@ def index():
             <p><strong>Slot:</strong> ${r.slot}</p>
             <p><strong>Task:</strong> ${r.id.slice(0, 12)}</p>
             <p><strong>Node:</strong> ${r.node_id.slice(0, 12)}</p>
+            <button type="button" class="arm-btn">Arm OFF</button>
           `;
           applyTileVisualState(el, isOn);
           grid.appendChild(el);
