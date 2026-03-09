@@ -268,8 +268,28 @@ def index():
     function setTileToggle(taskId, isOn) {
       const toggles = loadTileToggles();
       toggles[taskId] = isOn;
-      saveTileToggles(toggles);
+      try {
+        saveTileToggles(toggles);
+      } catch (e) {
+        // Ignore storage failures (private mode, disabled storage, quota)
+      }
     }
+
+    function applyTileVisualState(tileEl, isOn) {
+      tileEl.classList.toggle('active', isOn);
+      const badge = tileEl.querySelector('.status');
+      if (badge) badge.textContent = isOn ? 'ON' : 'OFF';
+    }
+
+    grid.addEventListener('click', (event) => {
+      const tile = event.target.closest('.chip');
+      if (!tile || !grid.contains(tile)) return;
+      const taskId = tile.dataset.taskId;
+      if (!taskId) return;
+      const nowOn = !tile.classList.contains('active');
+      applyTileVisualState(tile, nowOn);
+      setTileToggle(taskId, nowOn);
+    });
 
 
     replicasInput.addEventListener('focus', () => {
@@ -330,22 +350,17 @@ def index():
         for (const r of data.replicas) {
           const el = document.createElement('div');
           const isOn = tileToggles[r.id] === true;
-          el.className = `chip ${isOn ? 'active' : ''}`;
+          el.className = 'chip';
+          el.dataset.taskId = r.id;
           el.style.setProperty('--chip-color', r.color);
           el.innerHTML = `
-            <span class="status">${isOn ? 'ON' : 'OFF'}</span>
+            <span class="status">OFF</span>
             <h3>${r.name}</h3>
             <p><strong>Slot:</strong> ${r.slot}</p>
             <p><strong>Task:</strong> ${r.id.slice(0, 12)}</p>
             <p><strong>Node:</strong> ${r.node_id.slice(0, 12)}</p>
           `;
-          el.addEventListener('click', () => {
-            const nowOn = !el.classList.contains('active');
-            el.classList.toggle('active', nowOn);
-            const badge = el.querySelector('.status');
-            if (badge) badge.textContent = nowOn ? 'ON' : 'OFF';
-            setTileToggle(r.id, nowOn);
-          });
+          applyTileVisualState(el, isOn);
           grid.appendChild(el);
         }
       } catch (e) {
