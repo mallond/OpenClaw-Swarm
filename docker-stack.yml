@@ -1,6 +1,17 @@
 version: "3.9"
 
 services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
   memcached:
     image: memcached:1.6-alpine
     command: ["memcached", "-m", "64", "-p", "11211", "-u", "memcache"]
@@ -47,3 +58,6 @@ services:
         delay: 5s
       restart_policy:
         condition: any
+
+volumes:
+  ollama_data:
