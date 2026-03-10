@@ -8,6 +8,7 @@ from threading import Thread
 import time
 import random
 import re
+import subprocess
 from urllib import request as urlrequest
 
 import docker
@@ -495,36 +496,22 @@ def read_rps_state():
 
 
 def fetch_haiku_via_picoclaw():
-    if not PICOCLAW_URL:
-        return None
-    payload = {
-        "model": "smollm2",
-        "messages": [
-            {
-                "role": "user",
-                "content": "Write exactly one short 3-line haiku about distributed systems. Output only the poem.",
-            }
-        ],
-        "temperature": 0.7,
-        "max_tokens": 80,
-    }
-    req = urlrequest.Request(
-        PICOCLAW_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    prompt = "Write exactly one short 3-line haiku about distributed systems. Output only the poem."
     try:
-        with urlrequest.urlopen(req, timeout=12) as resp:
-            raw = resp.read().decode("utf-8")
-        data = json.loads(raw)
-        choices = data.get("choices") or []
-        if choices and isinstance(choices, list):
-            msg = (choices[0] or {}).get("message") or {}
-            txt = (msg.get("content") or "").strip()
-            if txt:
-                return txt
-        txt = (data.get("text") or data.get("response") or data.get("haiku") or "").strip()
+        proc = subprocess.run(
+            ["picoclaw", "agent", "-m", prompt],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if proc.returncode != 0:
+            return None
+        raw = strip_ansi((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        lines = [ln.strip().replace("🦞", "") for ln in raw.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if "[INFO]" not in ln and "WARNING:" not in ln]
+        if not lines:
+            return None
+        txt = lines[-1].strip()
         return txt or None
     except Exception:
         return None
@@ -616,12 +603,6 @@ def strip_ansi(text: str) -> str:
 
 def fetch_three_words_via_picoclaw_exec() -> str:
     try:
-        client = docker_client()
-        cands = client.containers.list(filters={"label": "com.docker.swarm.service.name=clawbucket_picoclaw", "status": "running"})
-        if not cands:
-            return ""
-        picoclaw_ctr = cands[0]
-
         themes = [
             "distributed systems",
             "swarm cluster",
@@ -639,15 +620,22 @@ def fetch_three_words_via_picoclaw_exec() -> str:
             f"No punctuation, no numbers, no explanation. nonce {nonce}."
         )
 
-        cmd = ["picoclaw", "agent", "-m", prompt]
-        code, out = picoclaw_ctr.exec_run(cmd, stdout=True, stderr=False)
-        if code != 0:
+        proc = subprocess.run(
+            ["picoclaw", "agent", "-m", prompt],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        if proc.returncode != 0:
             return ""
-        txt = strip_ansi(out.decode("utf-8", errors="ignore"))
-        lines = [ln.strip() for ln in txt.splitlines() if ln.strip()]
+
+        raw = strip_ansi((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        lines = [ln.strip().replace("🦞", "") for ln in raw.splitlines() if ln.strip()]
+        lines = [ln for ln in lines if "[INFO]" not in ln and "WARNING:" not in ln]
         if not lines:
             return ""
-        candidate = lines[-1].replace("🦞", "").strip()
+
+        candidate = lines[-1]
         candidate = re.sub(r"[^a-zA-Z\s-]", "", candidate).strip().lower()
         words = [w for w in re.split(r"\s+", candidate) if w]
         if len(words) >= 3:

@@ -1,18 +1,6 @@
 version: "3.9"
 
 services:
-  picoclaw:
-    image: docker.io/sipeed/picoclaw:latest
-    ports:
-      - "18790:18790"
-    configs:
-      - source: picoclaw_config_v4
-        target: /root/.picoclaw/config.json
-    deploy:
-      replicas: 1
-      restart_policy:
-        condition: any
-
   ollama:
     image: ollama/ollama:latest
     ports:
@@ -58,7 +46,7 @@ services:
       - SWARM_SERVICE=clawbucket_clawbucket
       - MEMCACHED_HOST=clawbucket_memcached
       - MEMCACHED_PORT=11211
-      - PICOCLAW_URL=http://picoclaw:18790/v1/chat/completions
+      - PICOCLAW_URL=
       - OLLAMA_URL=http://ollama:11434/api/generate
       - OLLAMA_MODEL=smollm2:135m
     volumes:
@@ -77,6 +65,3 @@ services:
 volumes:
   ollama_data:
 
-configs:
-  picoclaw_config_v4:
-    file: ./picoclaw.config.json
