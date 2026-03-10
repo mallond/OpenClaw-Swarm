@@ -6,7 +6,7 @@ services:
     ports:
       - "18790:18790"
     configs:
-      - source: picoclaw_config_v2
+      - source: picoclaw_config_v4
         target: /root/.picoclaw/config.json
     deploy:
       replicas: 1
@@ -78,5 +78,5 @@ volumes:
   ollama_data:
 
 configs:
-  picoclaw_config_v2:
+  picoclaw_config_v4:
     file: ./picoclaw.config.json

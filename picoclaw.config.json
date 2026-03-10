@@ -2,7 +2,8 @@
   "agents": {
     "defaults": {
       "workspace": "/root/.picoclaw/workspace",
-      "model_name": "smollm2"
+      "model_name": "smollm2",
+      "max_tool_iterations": 0
     }
   },
   "model_list": [
@@ -14,6 +15,28 @@
       "request_timeout": 120
     }
   ],
+  "tools": {
+    "web": { "enabled": false },
+    "cron": { "enabled": false },
+    "exec": { "enabled": false },
+    "skills": { "enabled": false },
+    "media_cleanup": { "enabled": false },
+    "append_file": { "enabled": false },
+    "edit_file": { "enabled": false },
+    "find_skills": { "enabled": false },
+    "i2c": { "enabled": false },
+    "install_skill": { "enabled": false },
+    "list_dir": { "enabled": false },
+    "message": { "enabled": false },
+    "read_file": { "enabled": false },
+    "spawn": { "enabled": false },
+    "spi": { "enabled": false },
+    "subagent": { "enabled": false },
+    "web_fetch": { "enabled": false },
+    "send_file": { "enabled": false },
+    "write_file": { "enabled": false },
+    "mcp": { "enabled": false }
+  },
   "channels": {
     "maixcam": {
       "enabled": true,
