@@ -44,6 +44,36 @@ services:
       - TASK_SLOT={{.Task.Slot}}
       - TASK_ID={{.Task.ID}}
       - SWARM_SERVICE=clawbucket_clawbucket
+      - SWARM_SERVICES=clawbucket_clawbucket,clawbucket_clawbucket-b
+      - MEMCACHED_HOST=clawbucket_memcached
+      - MEMCACHED_PORT=11211
+      - PICOCLAW_URL=
+      - PICOCLAW_ENABLED=0
+      - OLLAMA_URL=http://ollama:11434/api/generate
+      - OLLAMA_MODEL=smollm2:135m
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    deploy:
+      replicas: 3
+      placement:
+        constraints:
+          - node.role == manager
+      update_config:
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: any
+
+  clawbucket-b:
+    image: mallond/clawbucket:arm-agg-local
+    environment:
+      - SERVICE_NAME=clawbucket-b
+      - SWARM_NODE={{.Node.Hostname}}
+      - TASK_NAME={{.Task.Name}}
+      - TASK_SLOT={{.Task.Slot}}
+      - TASK_ID={{.Task.ID}}
+      - SWARM_SERVICE=clawbucket_clawbucket-b
+      - SWARM_SERVICES=clawbucket_clawbucket,clawbucket_clawbucket-b
       - MEMCACHED_HOST=clawbucket_memcached
       - MEMCACHED_PORT=11211
       - PICOCLAW_URL=

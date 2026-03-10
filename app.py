@@ -20,6 +20,7 @@ app = Flask(__name__)
 STARTED_AT = datetime.now(timezone.utc).isoformat()
 HOSTNAME = socket.gethostname()
 SERVICE_NAME = os.environ.get("SWARM_SERVICE", "clawbucket_clawbucket")
+SWARM_SERVICES = [s.strip() for s in os.environ.get("SWARM_SERVICES", f"{SERVICE_NAME},clawbucket_clawbucket-b").split(",") if s.strip()]
 MEMCACHED_HOST = os.environ.get("MEMCACHED_HOST", "memcached")
 MEMCACHED_PORT = int(os.environ.get("MEMCACHED_PORT", "11211"))
 CHAT_KEY = "clawbucket:chat:messages"
@@ -763,9 +764,9 @@ def generated_name(task_id: str) -> str:
     return f"{adjectives[h % len(adjectives)]} {nouns[(h // len(adjectives)) % len(nouns)]}"
 
 
-def get_service_state():
+def get_service_state(service_name: str):
     client = docker_client()
-    service = client.services.get(SERVICE_NAME)
+    service = client.services.get(service_name)
     attrs = service.attrs
     desired = attrs["Spec"]["Mode"]["Replicated"]["Replicas"]
 
@@ -818,7 +819,7 @@ def get_service_state():
         running[manager_idx]["is_manager"] = True
 
     return {
-        "service": SERVICE_NAME,
+        "service": service_name,
         "desired_replicas": desired,
         "running_count": len(running),
         "replicas": running,
@@ -833,30 +834,46 @@ def whoami():
 @app.get("/api/swarm")
 def api_swarm():
     try:
-        return jsonify(get_service_state())
+        primary = SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME
+        return jsonify(get_service_state(primary))
     except NotFound:
-        return jsonify({"error": f"Service '{SERVICE_NAME}' not found"}), 404
+        return jsonify({"error": "Primary swarm service not found"}), 404
     except DockerException as e:
         return jsonify({"error": f"Docker API unavailable: {str(e)}"}), 503
+
+
+@app.get("/api/swarms")
+def api_swarms():
+    out = []
+    for svc_name in SWARM_SERVICES or [SERVICE_NAME]:
+        try:
+            out.append(get_service_state(svc_name))
+        except Exception as e:
+            out.append({"service": svc_name, "error": str(e), "desired_replicas": 0, "running_count": 0, "replicas": []})
+    return jsonify({"swarms": out})
 
 
 @app.post("/api/scale")
 def api_scale():
     data = request.get_json(silent=True) or {}
     replicas = data.get("replicas")
+    service_name = (data.get("service") or (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)).strip()
+    allowed = set(SWARM_SERVICES or [SERVICE_NAME])
+    if service_name not in allowed:
+        return jsonify({"error": f"service must be one of: {', '.join(sorted(allowed))}"}), 400
     if not isinstance(replicas, int) or replicas < 1 or replicas > 20:
         return jsonify({"error": "replicas must be an integer between 1 and 20"}), 400
 
-    def do_scale(target: int):
+    def do_scale(target: int, svc: str):
         try:
             client = docker_client()
-            service = client.services.get(SERVICE_NAME)
+            service = client.services.get(svc)
             service.scale(target)
         except Exception:
             pass
 
-    Thread(target=do_scale, args=(replicas,), daemon=True).start()
-    return jsonify({"ok": True, "service": SERVICE_NAME, "desired_replicas": replicas, "status": "scaling"}), 202
+    Thread(target=do_scale, args=(replicas, service_name), daemon=True).start()
+    return jsonify({"ok": True, "service": service_name, "desired_replicas": replicas, "status": "scaling"}), 202
 
 
 @app.get("/api/chat")
@@ -1055,20 +1072,7 @@ def index():
     <h1>🌍 Bob's World</h1>
     <div class=\"sub\">Swarm replicas as chicklets + quick scaling control.</div>
 
-    <div class=\"panel\">
-      <div class=\"row\">
-        <strong id=\"svc\">service: ...</strong>
-        <span class=\"meta\" id=\"counts\">running: - / desired: -</span>
-      </div>
-      <div class=\"row\" style=\"margin-top:12px\">
-        <label for=\"replicas\">Replicas:</label>
-        <input id=\"replicas\" type=\"number\" min=\"1\" max=\"25\" step=\"1\" value=\"3\" style=\"width:90px\" />
-        <button id=\"apply\">Scale Swarm</button>
-        <span class=\"meta\" id=\"msg\"></span>
-      </div>
-    </div>
-
-    <div class=\"grid\" id=\"grid\"></div>
+    <div id=\"swarmPanels\" style=\"display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:14px;\"></div>
 
     <div class=\"panel\" style=\"margin-top:16px\">
       <div class=\"row\">
@@ -1104,12 +1108,7 @@ def index():
   </div>
 
   <script>
-    const grid = document.getElementById('grid');
-    const svc = document.getElementById('svc');
-    const counts = document.getElementById('counts');
-    const replicasInput = document.getElementById('replicas');
-    const applyBtn = document.getElementById('apply');
-    const msg = document.getElementById('msg');
+    const swarmPanels = document.getElementById('swarmPanels');
     const chatInput = document.getElementById('chatInput');
     const chatSend = document.getElementById('chatSend');
     const haikuBox = document.getElementById('haikuBox');
@@ -1119,11 +1118,8 @@ def index():
     const rpsApply = document.getElementById('rpsApply');
     const rpsMsg = document.getElementById('rpsMsg');
     const rpsState = document.getElementById('rpsState');
-    let pendingTarget = null;
-    let currentDesired = null;
-    let currentRunning = null;
-    let isEditingReplicaInput = false;
     const TILE_TOGGLE_KEY = 'clawbucket.tileToggles';
+    const pendingTargets = {};
 
     function loadTileToggles() {
       try {
@@ -1142,11 +1138,7 @@ def index():
     function setTileToggle(taskId, isOn) {
       const toggles = loadTileToggles();
       toggles[taskId] = isOn;
-      try {
-        saveTileToggles(toggles);
-      } catch (e) {
-        // Ignore storage failures (private mode, disabled storage, quota)
-      }
+      try { saveTileToggles(toggles); } catch {}
     }
 
     function applyTileVisualState(tileEl, isOn) {
@@ -1156,15 +1148,12 @@ def index():
         badge.classList.toggle('on', isOn);
       }
       const armBtn = tileEl.querySelector('.arm-btn');
-      if (armBtn) {
-        armBtn.classList.toggle('on', isOn);
-        armBtn.textContent = 'Arm';
-      }
+      if (armBtn) armBtn.classList.toggle('on', isOn);
     }
 
-    grid.addEventListener('click', (event) => {
+    document.addEventListener('click', (event) => {
       const armBtn = event.target.closest('.arm-btn');
-      if (!armBtn || !grid.contains(armBtn)) return;
+      if (!armBtn) return;
       const tile = armBtn.closest('.chip');
       if (!tile) return;
       const taskId = tile.dataset.taskId;
@@ -1173,36 +1162,104 @@ def index():
       const nowOn = !armBtn.classList.contains('on');
       applyTileVisualState(tile, nowOn);
       setTileToggle(taskId, nowOn);
-
       fetch('/api/arm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          task_id: taskId,
-          bot: botName,
-          state: nowOn ? 'on' : 'off',
-        }),
+        body: JSON.stringify({ task_id: taskId, bot: botName, state: nowOn ? 'on' : 'off' }),
       }).catch(() => {});
     });
 
+    async function scaleService(serviceName, replicas, msgEl, btnEl, inputEl) {
+      if (!Number.isInteger(replicas) || replicas < 1 || replicas > 25) {
+        msgEl.textContent = 'Replicas must be 1-25';
+        return;
+      }
+      if (pendingTargets[serviceName] !== undefined) {
+        msgEl.textContent = `Scaling in progress to ${pendingTargets[serviceName]}...`;
+        return;
+      }
+      pendingTargets[serviceName] = replicas;
+      btnEl.disabled = true;
+      inputEl.disabled = true;
+      msgEl.textContent = `Scaling ${serviceName} to ${replicas}...`;
+      try {
+        const res = await fetch('/api/scale', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service: serviceName, replicas }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Scale failed');
+      } catch (e) {
+        delete pendingTargets[serviceName];
+        msgEl.textContent = e.message;
+      } finally {
+        btnEl.disabled = false;
+        inputEl.disabled = false;
+      }
+    }
 
-    replicasInput.addEventListener('focus', () => {
-      isEditingReplicaInput = true;
-    });
+    function renderSwarms(swarms) {
+      const toggles = loadTileToggles();
+      swarmPanels.innerHTML = '';
+      for (const s of swarms || []) {
+        const panel = document.createElement('div');
+        panel.className = 'panel';
 
-    replicasInput.addEventListener('blur', () => {
-      isEditingReplicaInput = false;
-    });
+        const top = document.createElement('div');
+        top.className = 'row';
+        top.innerHTML = `<strong>${s.service}</strong><span class="meta">running: ${s.running_count} / desired: ${s.desired_replicas}</span>`;
 
-    // Prevent accidental mouse-wheel value changes on number input.
-    replicasInput.addEventListener('wheel', (e) => {
-      e.preventDefault();
-    }, { passive: false });
+        const controls = document.createElement('div');
+        controls.className = 'row';
+        controls.style.marginTop = '10px';
+        const input = document.createElement('input');
+        input.type = 'number'; input.min = '1'; input.max = '25'; input.step = '1';
+        input.value = String(s.desired_replicas || 1); input.style.width = '90px';
+        const btn = document.createElement('button');
+        btn.textContent = 'Scale';
+        const msg = document.createElement('span');
+        msg.className = 'meta';
+        btn.addEventListener('click', () => scaleService(s.service, parseInt(input.value, 10), msg, btn, input));
+        controls.append('Replicas:', input, btn, msg);
 
-    // Scaling should happen only by clicking the button.
-    replicasInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') e.preventDefault();
-    });
+        if (pendingTargets[s.service] !== undefined && s.running_count === pendingTargets[s.service] && s.desired_replicas === pendingTargets[s.service]) {
+          delete pendingTargets[s.service];
+          msg.textContent = `Stable at ${s.running_count}`;
+        }
+
+        const grid = document.createElement('div');
+        grid.className = 'grid';
+        grid.style.marginTop = '12px';
+
+        const sortedReplicas = [...(s.replicas || [])].sort((a,b)=> (b.score||0)-(a.score||0) || (a.slot||0)-(b.slot||0));
+        for (const r of sortedReplicas) {
+          const el = document.createElement('div');
+          const isOn = toggles[r.id] === true;
+          el.className = `chip ${r.is_manager ? 'manager' : ''}`;
+          el.dataset.taskId = r.id;
+          el.dataset.botName = r.name;
+          el.style.setProperty('--chip-color', r.color);
+          const scoreClass = (r.score || 0) < 0 ? 'negative' : 'positive';
+          const scoreText = (r.score || 0) > 0 ? `+${r.score}` : `${r.score || 0}`;
+          el.innerHTML = `
+            <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}
+            <h3>${r.name}</h3>
+            ${r.is_manager ? '' : `<div class="score ${scoreClass}">${scoreText}</div>`}
+            <p><strong>Slot:</strong> ${r.slot}</p>
+            <p><strong>Task:</strong> ${String(r.id || '').slice(0, 12)}</p>
+            <p><strong>Node:</strong> ${String(r.node_id || '').slice(0, 12)}</p>
+            <button type="button" class="arm-btn">Arm</button>
+            <div class="threewords">${r.three_words || ''}</div>
+          `;
+          applyTileVisualState(el, isOn);
+          grid.appendChild(el);
+        }
+
+        panel.append(top, controls, grid);
+        swarmPanels.appendChild(panel);
+      }
+    }
 
     function renderChat(messages) {
       const rows = (messages || []).slice(-12).reverse();
@@ -1322,125 +1379,14 @@ def index():
 
     async function loadState() {
       try {
-        const res = await fetch('/api/swarm');
+        const res = await fetch('/api/swarms');
         const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Unable to load swarm data');
-
-        svc.textContent = `service: ${data.service}`;
-        counts.textContent = `running: ${data.running_count} / desired: ${data.desired_replicas}`;
-        currentDesired = data.desired_replicas;
-        currentRunning = data.running_count;
-
-        if (pendingTarget === null && !isEditingReplicaInput) {
-          replicasInput.value = data.desired_replicas;
-        }
-
-        if (pendingTarget !== null) {
-          applyBtn.disabled = true;
-          replicasInput.disabled = true;
-          if (data.desired_replicas === pendingTarget && data.running_count === pendingTarget) {
-            pendingTarget = null;
-            applyBtn.disabled = false;
-            replicasInput.disabled = false;
-            replicasInput.value = data.desired_replicas;
-            msg.textContent = `Scale complete: ${data.running_count} / ${data.desired_replicas}`;
-          } else {
-            msg.textContent = `Scaling in progress... running ${data.running_count} / desired ${data.desired_replicas}`;
-          }
-        } else {
-          applyBtn.disabled = false;
-          replicasInput.disabled = false;
-          msg.textContent = (data.running_count === data.desired_replicas)
-            ? `Stable: ${data.running_count} / ${data.desired_replicas}`
-            : `Reconciling: running ${data.running_count} / desired ${data.desired_replicas}`;
-        }
-
-        const tileToggles = loadTileToggles();
-        const sortedReplicas = [...(data.replicas || [])].sort((a, b) => {
-          const sa = Number.isFinite(a.score) ? a.score : 0;
-          const sb = Number.isFinite(b.score) ? b.score : 0;
-          if (sb !== sa) return sb - sa;
-          return (a.slot || 0) - (b.slot || 0);
-        });
-
-        grid.innerHTML = '';
-        for (const r of sortedReplicas) {
-          const el = document.createElement('div');
-          const isOn = tileToggles[r.id] === true;
-          el.className = `chip ${r.is_manager ? 'manager' : ''}`;
-          el.dataset.taskId = r.id;
-          el.dataset.botName = r.name;
-          el.style.setProperty('--chip-color', r.color);
-          const scoreClass = (r.score || 0) < 0 ? 'negative' : 'positive';
-          const scoreText = (r.score || 0) > 0 ? `+${r.score}` : `${r.score || 0}`;
-          el.innerHTML = `
-            <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}
-            <h3>${r.name}</h3>
-            ${r.is_manager ? '' : `<div class="score ${scoreClass}">${scoreText}</div>`}
-            <p><strong>Slot:</strong> ${r.slot}</p>
-            <p><strong>Task:</strong> ${r.id.slice(0, 12)}</p>
-            <p><strong>Node:</strong> ${r.node_id.slice(0, 12)}</p>
-            <button type="button" class="arm-btn">Arm</button>
-            <div class="threewords">${r.three_words || ''}</div>
-          `;
-          applyTileVisualState(el, isOn);
-          grid.appendChild(el);
-        }
+        if (!res.ok) throw new Error(data.error || 'Unable to load swarms');
+        renderSwarms(data.swarms || []);
       } catch (e) {
-        msg.textContent = e.message;
+        swarmPanels.innerHTML = `<div class="panel"><div class="meta">${e.message}</div></div>`;
       }
     }
-
-    applyBtn.addEventListener('click', async () => {
-      const replicas = parseInt(replicasInput.value, 10);
-      if (!Number.isInteger(replicas) || replicas < 1 || replicas > 25) {
-        msg.textContent = 'Replicas must be a whole number between 1 and 25';
-        return;
-      }
-
-      if (pendingTarget !== null) {
-        msg.textContent = `Please wait — scaling to ${pendingTarget} in progress`;
-        return;
-      }
-
-      if (currentDesired === replicas && currentRunning === replicas) {
-        msg.textContent = `Already at ${replicas} replicas`;
-        return;
-      }
-
-      pendingTarget = replicas;
-      applyBtn.disabled = true;
-      replicasInput.disabled = true;
-      msg.textContent = `Scaling requested: target ${replicas}...`;
-
-      async function postScaleOnce() {
-        const res = await fetch('/api/scale', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ replicas }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Scale failed');
-        return data;
-      }
-
-      try {
-        await postScaleOnce();
-        setTimeout(loadState, 1000);
-      } catch (e) {
-        // Routing mesh can briefly drop the first request while tasks are being replaced.
-        try {
-          await new Promise(r => setTimeout(r, 500));
-          await postScaleOnce();
-          setTimeout(loadState, 1000);
-        } catch (e2) {
-          pendingTarget = null;
-          applyBtn.disabled = false;
-          replicasInput.disabled = false;
-          msg.textContent = e2.message || e.message;
-        }
-      }
-    });
 
     loadState();
     loadChat();
