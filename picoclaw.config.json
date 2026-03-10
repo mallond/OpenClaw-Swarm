@@ -1,0 +1,29 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "/root/.picoclaw/workspace",
+      "model_name": "smollm2"
+    }
+  },
+  "model_list": [
+    {
+      "model_name": "smollm2",
+      "model": "ollama/smollm2:135m",
+      "api_base": "http://ollama:11434/v1",
+      "api_key": "ollama",
+      "request_timeout": 120
+    }
+  ],
+  "channels": {
+    "maixcam": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 18791,
+      "allow_from": []
+    }
+  },
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 18790
+  }
+}

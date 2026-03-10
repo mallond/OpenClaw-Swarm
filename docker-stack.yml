@@ -3,8 +3,11 @@ version: "3.9"
 services:
   picoclaw:
     image: docker.io/sipeed/picoclaw:latest
-    volumes:
-      - picoclaw_data:/root/.picoclaw
+    ports:
+      - "18790:18790"
+    configs:
+      - source: picoclaw_config_v2
+        target: /root/.picoclaw/config.json
     deploy:
       replicas: 1
       restart_policy:
@@ -55,7 +58,7 @@ services:
       - SWARM_SERVICE=clawbucket_clawbucket
       - MEMCACHED_HOST=clawbucket_memcached
       - MEMCACHED_PORT=11211
-      - PICOCLAW_URL=http://picoclaw:8080/api/haiku
+      - PICOCLAW_URL=http://picoclaw:18790/v1/chat/completions
       - OLLAMA_URL=http://ollama:11434/api/generate
       - OLLAMA_MODEL=smollm2:135m
     volumes:
@@ -73,4 +76,7 @@ services:
 
 volumes:
   ollama_data:
-  picoclaw_data:
+
+configs:
+  picoclaw_config_v2:
+    file: ./picoclaw.config.json

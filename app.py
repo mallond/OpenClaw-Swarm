@@ -35,7 +35,7 @@ PLAYER_LAST_SEEN_PREFIX = "clawbucket:rps:last_seen:"
 HAIKU_KEY = "clawbucket:haiku:latest"
 HAIKU_INTERVAL_SECONDS = 120
 HAIKU_TTL_SECONDS = 300
-PICOCLAW_URL = os.environ.get("PICOCLAW_URL", "").strip()
+PICOCLAW_URL = os.environ.get("PICOCLAW_URL", "http://picoclaw:18790/v1/chat/completions").strip()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "smollm2:135m")
 
@@ -442,7 +442,14 @@ def fetch_haiku_via_picoclaw():
     if not PICOCLAW_URL:
         return None
     payload = {
-        "prompt": "Write exactly one short 3-line haiku about distributed systems.",
+        "model": "smollm2",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Write exactly one short 3-line haiku about distributed systems. Output only the poem.",
+            }
+        ],
+        "temperature": 0.7,
         "max_tokens": 80,
     }
     req = urlrequest.Request(
@@ -452,9 +459,15 @@ def fetch_haiku_via_picoclaw():
         method="POST",
     )
     try:
-        with urlrequest.urlopen(req, timeout=8) as resp:
+        with urlrequest.urlopen(req, timeout=12) as resp:
             raw = resp.read().decode("utf-8")
         data = json.loads(raw)
+        choices = data.get("choices") or []
+        if choices and isinstance(choices, list):
+            msg = (choices[0] or {}).get("message") or {}
+            txt = (msg.get("content") or "").strip()
+            if txt:
+                return txt
         txt = (data.get("text") or data.get("response") or data.get("haiku") or "").strip()
         return txt or None
     except Exception:
