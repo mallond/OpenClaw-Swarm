@@ -33,6 +33,11 @@ RPS_STATE_KEY = "clawbucket:rps:state"
 RPS_INTERVAL_KEY = "clawbucket:rps:interval_seconds"
 RPS_DEFAULT_INTERVAL_SECONDS = 10
 RPS_TTL_SECONDS = 20
+DUEL_EVENTS_KEY = "clawbucket:duel:events"
+DUEL_EVENTS_LIMIT = 120
+DUEL_INTERVAL_KEY = "clawbucket:duel:interval_seconds"
+DUEL_DEFAULT_INTERVAL_SECONDS = 15
+DUEL_REMOVE_CHANCE = 0.55
 PLAYER_SCORE_PREFIX = "clawbucket:rps:score:"
 PLAYER_LAST_SEEN_PREFIX = "clawbucket:rps:last_seen:"
 MANAGER_OVERRIDE_SLOT_PREFIX = "clawbucket:manager:override:slot:"
@@ -257,6 +262,83 @@ def set_rps_interval_seconds(value: int) -> int:
         except Exception:
             pass
     return value
+
+
+def get_duel_interval_seconds() -> int:
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(DUEL_INTERVAL_KEY)
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        if raw is None:
+            return DUEL_DEFAULT_INTERVAL_SECONDS
+        value = int(raw)
+        return max(3, min(180, value))
+    except Exception:
+        return DUEL_DEFAULT_INTERVAL_SECONDS
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def set_duel_interval_seconds(value: int) -> int:
+    value = max(3, min(180, int(value)))
+    client = None
+    try:
+        client = memcache_client()
+        client.set(DUEL_INTERVAL_KEY, str(value), expire=86400)
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    return value
+
+
+def load_duel_events():
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(DUEL_EVENTS_KEY)
+        if not raw:
+            return []
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data[-DUEL_EVENTS_LIMIT:]
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    return []
+
+
+def append_duel_event(event: dict):
+    items = load_duel_events()
+    items.append(event)
+    items = items[-DUEL_EVENTS_LIMIT:]
+    client = None
+    try:
+        client = memcache_client()
+        client.set(DUEL_EVENTS_KEY, json.dumps(items), expire=86400)
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
 
 
 def is_this_task_on_leader_manager() -> bool:
@@ -874,6 +956,85 @@ def get_service_state(service_name: str):
     }
 
 
+def list_running_task_rows(service_name: str):
+    client = docker_client()
+    service = client.services.get(service_name)
+    rows = []
+    for t in service.tasks():
+        status = t.get("Status", {}) or {}
+        state = status.get("State", "")
+        if state not in {"running", "starting", "ready", "preparing"}:
+            continue
+        cstatus = status.get("ContainerStatus", {}) or {}
+        rows.append({
+            "id": t.get("ID", ""),
+            "slot": int(t.get("Slot") or 0),
+            "node_id": t.get("NodeID", ""),
+            "container_id": cstatus.get("ContainerID"),
+            "name": generated_name(t.get("ID", "")),
+            "service": service_name,
+        })
+    return rows
+
+
+def is_duel_game_master() -> bool:
+    primary = (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)
+    return os.environ.get("SWARM_SERVICE", "") == primary and is_this_task_on_leader_manager()
+
+
+def duel_once():
+    if len(SWARM_SERVICES) < 2:
+        return None
+
+    svc_a, svc_b = SWARM_SERVICES[0], SWARM_SERVICES[1]
+    rows_a = list_running_task_rows(svc_a)
+    rows_b = list_running_task_rows(svc_b)
+    if not rows_a or not rows_b:
+        return None
+
+    challenger = random.choice(rows_a)
+    defender = random.choice(rows_b)
+
+    # Equal-probability duel; future: weight by score/history.
+    challenger_wins = random.random() < 0.5
+    winner = challenger if challenger_wins else defender
+    loser = defender if challenger_wins else challenger
+
+    loser_removed = random.random() < DUEL_REMOVE_CHANCE
+    if loser_removed and loser.get("container_id"):
+        try:
+            ctr = docker_client().containers.get(loser["container_id"])
+            ctr.kill()
+        except Exception:
+            pass
+
+    event = {
+        "id": hashlib.md5(f"duel:{time.time()}:{challenger['id']}:{defender['id']}".encode("utf-8")).hexdigest()[:12],
+        "at": datetime.now(timezone.utc).isoformat(),
+        "challenger": {"service": challenger["service"], "task_id": challenger["id"], "name": challenger["name"], "slot": challenger["slot"]},
+        "defender": {"service": defender["service"], "task_id": defender["id"], "name": defender["name"], "slot": defender["slot"]},
+        "winner": {"service": winner["service"], "task_id": winner["id"], "name": winner["name"], "slot": winner["slot"]},
+        "loser": {"service": loser["service"], "task_id": loser["id"], "name": loser["name"], "slot": loser["slot"]},
+        "loser_removed": loser_removed,
+        "rules": {
+            "win_mode": "random_50_50",
+            "loser_removed_probability": DUEL_REMOVE_CHANCE,
+        },
+    }
+    append_duel_event(event)
+    return event
+
+
+def duel_loop():
+    while True:
+        try:
+            if is_duel_game_master():
+                duel_once()
+        except Exception:
+            pass
+        time.sleep(get_duel_interval_seconds())
+
+
 @app.get("/api/whoami")
 def whoami():
     return jsonify(whoami_payload())
@@ -1037,6 +1198,39 @@ def api_rps_get():
         "interval_seconds": get_rps_interval_seconds(),
         "ttl_seconds": RPS_TTL_SECONDS,
     })
+
+
+@app.get("/api/duel")
+def api_duel_get():
+    return jsonify({
+        "events": load_duel_events(),
+        "interval_seconds": get_duel_interval_seconds(),
+        "remove_chance": DUEL_REMOVE_CHANCE,
+        "services": SWARM_SERVICES,
+        "rules": {
+            "challenge": "one task from swarm A challenges one task from swarm B",
+            "winner": "random 50/50",
+            "loser": "removed with configured probability, otherwise survives",
+        },
+    })
+
+
+@app.post("/api/duel/config")
+def api_duel_config_post():
+    data = request.get_json(silent=True) or {}
+    interval = data.get("interval_seconds")
+    if not isinstance(interval, int):
+        return jsonify({"error": "interval_seconds must be an integer"}), 400
+    value = set_duel_interval_seconds(interval)
+    return jsonify({"ok": True, "interval_seconds": value})
+
+
+@app.post("/api/duel/now")
+def api_duel_now_post():
+    ev = duel_once()
+    if not ev:
+        return jsonify({"error": "unable to run duel (need two swarms with running tasks)"}), 409
+    return jsonify({"ok": True, "event": ev}), 201
 
 
 @app.post("/api/rps/config")
@@ -1213,6 +1407,19 @@ def index():
     </div>
 
     <div class=\"panel\" style=\"margin-top:16px\">
+      <div class=\"row\"><strong>Cross-Swarm Duels</strong></div>
+      <div class=\"row\" style=\"margin-top:10px\">
+        <label for=\"duelInterval\">Interval (seconds):</label>
+        <input id=\"duelInterval\" type=\"number\" min=\"3\" max=\"180\" step=\"1\" value=\"15\" style=\"width:90px\" />
+        <button id=\"duelApply\">Apply Interval</button>
+        <button id=\"duelNow\">Run Duel Now</button>
+        <span class=\"meta\" id=\"duelMsg\"></span>
+      </div>
+      <div class=\"meta\" id=\"duelRules\" style=\"margin-top:8px\"></div>
+      <div id=\"duelFeed\" style=\"margin-top:10px; display:grid; gap:6px; max-height:180px; overflow:auto;\"></div>
+    </div>
+
+    <div class=\"panel\" style=\"margin-top:16px\">
       <div class=\"row\">
         <strong>Container Conversation (Memcached simulation)</strong>
       </div>
@@ -1236,6 +1443,12 @@ def index():
     const rpsApply = document.getElementById('rpsApply');
     const rpsMsg = document.getElementById('rpsMsg');
     const rpsState = document.getElementById('rpsState');
+    const duelInterval = document.getElementById('duelInterval');
+    const duelApply = document.getElementById('duelApply');
+    const duelNow = document.getElementById('duelNow');
+    const duelMsg = document.getElementById('duelMsg');
+    const duelFeed = document.getElementById('duelFeed');
+    const duelRules = document.getElementById('duelRules');
     const TILE_TOGGLE_KEY = 'clawbucket.tileToggles';
     const pendingTargets = {};
 
@@ -1515,6 +1728,78 @@ def index():
       }
     });
 
+    async function loadDuel() {
+      try {
+        const res = await fetch('/api/duel');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Duel unavailable');
+        if (document.activeElement !== duelInterval) {
+          duelInterval.value = data.interval_seconds;
+        }
+        duelRules.textContent = `Rules: random winner (50/50). Loser removal chance: ${Math.round((data.remove_chance || 0) * 100)}%. Services: ${(data.services || []).join(' vs ')}`;
+
+        const rows = (data.events || []).slice(-10).reverse();
+        duelFeed.innerHTML = '';
+        for (const ev of rows) {
+          const row = document.createElement('div');
+          row.className = 'meta';
+          row.style.padding = '6px 8px';
+          row.style.border = '1px solid #2b3a67';
+          row.style.borderRadius = '8px';
+          row.style.background = '#0f1730';
+          const when = (ev.at || '').slice(11, 19);
+          const c = ev.challenger?.name || 'challenger';
+          const d = ev.defender?.name || 'defender';
+          const w = ev.winner?.name || 'winner';
+          row.textContent = `[${when}] ${c} challenged ${d} → WIN: ${w}${ev.loser_removed ? ' (loser removed)' : ' (loser spared)'}`;
+          duelFeed.appendChild(row);
+        }
+        if (!rows.length) duelFeed.innerHTML = '<div class="meta">No duels yet.</div>';
+      } catch (e) {
+        duelMsg.textContent = e.message;
+      }
+    }
+
+    duelApply.addEventListener('click', async () => {
+      const n = parseInt(duelInterval.value, 10);
+      if (!Number.isInteger(n) || n < 3 || n > 180) {
+        duelMsg.textContent = 'Interval must be 3-180 seconds';
+        return;
+      }
+      duelApply.disabled = true;
+      duelMsg.textContent = 'Saving...';
+      try {
+        const res = await fetch('/api/duel/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ interval_seconds: n }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to set duel interval');
+        duelMsg.textContent = `Duel interval set to ${data.interval_seconds}s`;
+      } catch (e) {
+        duelMsg.textContent = e.message;
+      } finally {
+        duelApply.disabled = false;
+      }
+    });
+
+    duelNow.addEventListener('click', async () => {
+      duelNow.disabled = true;
+      duelMsg.textContent = 'Launching duel...';
+      try {
+        const res = await fetch('/api/duel/now', { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to run duel');
+        duelMsg.textContent = 'Duel complete';
+        await loadDuel();
+      } catch (e) {
+        duelMsg.textContent = e.message;
+      } finally {
+        duelNow.disabled = false;
+      }
+    });
+
     async function loadState() {
       try {
         const res = await fetch('/api/swarms');
@@ -1530,10 +1815,12 @@ def index():
     loadChat();
     loadHaiku();
     loadRps();
+    loadDuel();
     setInterval(loadState, 3000);
     setInterval(loadChat, 4000);
     setInterval(loadHaiku, 5000);
     setInterval(loadRps, 3000);
+    setInterval(loadDuel, 3000);
   </script>
 </body>
 </html>
@@ -1543,6 +1830,7 @@ def index():
 if __name__ == "__main__":
     Thread(target=heartbeat_loop, daemon=True).start()
     Thread(target=rps_loop, daemon=True).start()
+    Thread(target=duel_loop, daemon=True).start()
     Thread(target=haiku_loop, daemon=True).start()
     Thread(target=three_words_loop, daemon=True).start()
     Thread(target=player_loop, daemon=True).start()
