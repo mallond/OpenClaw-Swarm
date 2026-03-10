@@ -110,6 +110,8 @@ Defined in `docker-stack.yml`:
 6. **Haiku loop**
    - periodic generated haiku with PicoClaw-first, Ollama-fallback behavior
 
+<img width="647" height="738" alt="image" src="https://github.com/user-attachments/assets/aba8c238-8c84-42aa-a0cd-33111a4e799b" />
+
 ---
 
 ## 5) Memcached keys (important)
