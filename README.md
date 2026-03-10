@@ -30,6 +30,8 @@ This allows **one-to-many scaling** of OpenClaw-style behavior:
 
 In short: **OpenClaw can run an army of one or many.**
 
+<img width="796" height="688" alt="Screenshot 2026-03-10 122019" src="https://github.com/user-attachments/assets/61359cd3-072b-4e62-b8b4-faca957c103b" />
+
 ---
 
 ## 2) OpenClaw + PicoClaw collaboration design
