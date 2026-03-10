@@ -49,6 +49,7 @@ DUEL_EVENTS_LIMIT = 120
 DUEL_INTERVAL_KEY = "clawbucket:duel:interval_seconds"
 DUEL_DEFAULT_INTERVAL_SECONDS = 15
 DUEL_REMOVE_CHANCE = 0.55
+CLAW_BATTLE_SCORE_KEY = "clawbucket:duel:battle:score"
 PLAYER_SCORE_PREFIX = "clawbucket:rps:score:"
 PLAYER_LAST_SEEN_PREFIX = "clawbucket:rps:last_seen:"
 MANAGER_OVERRIDE_SLOT_PREFIX = "clawbucket:manager:override:slot:"
@@ -354,6 +355,68 @@ def append_duel_event(event: dict):
                 client.close()
         except Exception:
             pass
+
+
+def load_claw_battle_score() -> dict:
+    default = {
+        "services": {svc: 0 for svc in (SWARM_SERVICES[:2] if len(SWARM_SERVICES) >= 2 else SWARM_SERVICES)},
+        "rounds": 0,
+        "last_winner_service": None,
+        "updated_at": None,
+    }
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(CLAW_BATTLE_SCORE_KEY)
+        if not raw:
+            return default
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return default
+        services = data.get("services") if isinstance(data.get("services"), dict) else {}
+        for svc in default["services"].keys():
+            services.setdefault(svc, 0)
+        data["services"] = services
+        data.setdefault("rounds", 0)
+        data.setdefault("last_winner_service", None)
+        data.setdefault("updated_at", None)
+        return data
+    except Exception:
+        return default
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def save_claw_battle_score(score: dict):
+    client = None
+    try:
+        client = memcache_client()
+        client.set(CLAW_BATTLE_SCORE_KEY, json.dumps(score), expire=86400 * 14)
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def record_claw_battle_win(winner_service: str):
+    score = load_claw_battle_score()
+    services = score.setdefault("services", {})
+    services[winner_service] = int(services.get(winner_service, 0)) + 1
+    score["rounds"] = int(score.get("rounds", 0)) + 1
+    score["last_winner_service"] = winner_service
+    score["updated_at"] = datetime.now(timezone.utc).isoformat()
+    save_claw_battle_score(score)
+    return score
 
 
 def load_game_pairs() -> dict:
@@ -1121,33 +1184,68 @@ def duel_once():
     if not rows_a or not rows_b:
         return None
 
-    challenger = random.choice(rows_a)
-    defender = random.choice(rows_b)
+    def pick_manager_id(service_name: str):
+        try:
+            state = get_service_state(service_name)
+            for rep in (state.get("replicas") or []):
+                if rep.get("is_manager"):
+                    return rep.get("id")
+        except Exception:
+            pass
+        return rows_a[0].get("id") if service_name == svc_a and rows_a else (rows_b[0].get("id") if rows_b else None)
 
-    # Equal-probability duel; future: weight by score/history.
+    def pick_contestant(captain_id: str, rows: list, service_name: str):
+        if not rows:
+            return None
+        ordered = sorted(rows, key=lambda r: (r.get("slot", 9999), r.get("id", "")))
+        seed = f"{captain_id}:{service_name}:{int(time.time() // 10)}"
+        h = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16)
+        return ordered[h % len(ordered)]
+
+    captain_a_id = pick_manager_id(svc_a)
+    captain_b_id = pick_manager_id(svc_b)
+    captain_a = next((r for r in rows_a if r.get("id") == captain_a_id), rows_a[0])
+    captain_b = next((r for r in rows_b if r.get("id") == captain_b_id), rows_b[0])
+
+    challenger = pick_contestant(captain_a.get("id", ""), rows_a, svc_a)
+    defender = pick_contestant(captain_b.get("id", ""), rows_b, svc_b)
+    if not challenger or not defender:
+        return None
+
+    # Master of ceremony mode: captains pick fighters, then random arena outcome.
     challenger_wins = random.random() < 0.5
     winner = challenger if challenger_wins else defender
     loser = defender if challenger_wins else challenger
 
-    loser_removed = random.random() < DUEL_REMOVE_CHANCE
-    if loser_removed and loser.get("container_id"):
+    loser_removed = False
+    if loser.get("container_id"):
         try:
             ctr = docker_client().containers.get(loser["container_id"])
             ctr.kill()
+            loser_removed = True
         except Exception:
-            pass
+            loser_removed = False
+
+    score = record_claw_battle_win(winner.get("service", "unknown"))
 
     event = {
         "id": hashlib.md5(f"duel:{time.time()}:{challenger['id']}:{defender['id']}".encode("utf-8")).hexdigest()[:12],
         "at": datetime.now(timezone.utc).isoformat(),
+        "mode": "claw_battle",
+        "captains": {
+            "a": {"service": captain_a.get("service"), "task_id": captain_a.get("id"), "name": captain_a.get("name"), "slot": captain_a.get("slot")},
+            "b": {"service": captain_b.get("service"), "task_id": captain_b.get("id"), "name": captain_b.get("name"), "slot": captain_b.get("slot")},
+        },
         "challenger": {"service": challenger["service"], "task_id": challenger["id"], "name": challenger["name"], "slot": challenger["slot"]},
         "defender": {"service": defender["service"], "task_id": defender["id"], "name": defender["name"], "slot": defender["slot"]},
         "winner": {"service": winner["service"], "task_id": winner["id"], "name": winner["name"], "slot": winner["slot"]},
         "loser": {"service": loser["service"], "task_id": loser["id"], "name": loser["name"], "slot": loser["slot"]},
         "loser_removed": loser_removed,
+        "battle_score": score,
         "rules": {
+            "captains_choose_fighters": True,
             "win_mode": "random_50_50",
-            "loser_removed_probability": DUEL_REMOVE_CHANCE,
+            "loser_removed": "always_attempted",
         },
     }
     append_duel_event(event)
@@ -1334,12 +1432,12 @@ def api_duel_get():
     return jsonify({
         "events": load_duel_events(),
         "interval_seconds": get_duel_interval_seconds(),
-        "remove_chance": DUEL_REMOVE_CHANCE,
         "services": SWARM_SERVICES,
+        "battle_score": load_claw_battle_score(),
         "rules": {
-            "challenge": "one task from swarm A challenges one task from swarm B",
-            "winner": "random 50/50",
-            "loser": "removed with configured probability, otherwise survives",
+            "challenge": "captain agents (manager tasks) choose one fighter per swarm",
+            "winner": "random 50/50 arena outcome",
+            "loser": "removal is always attempted",
         },
     })
 
@@ -1801,14 +1899,15 @@ def index():
     </div>
 
     <div class=\"panel\" style=\"margin-top:16px\">
-      <div class=\"row\"><strong>Cross-Swarm Duels</strong></div>
+      <div class=\"row\"><strong>Cross-Swarm Claw Battle</strong></div>
       <div class=\"row\" style=\"margin-top:10px\">
         <label for=\"duelInterval\">Interval (seconds):</label>
         <input id=\"duelInterval\" type=\"number\" min=\"3\" max=\"180\" step=\"1\" value=\"15\" style=\"width:90px\" />
         <button id=\"duelApply\">Apply Interval</button>
-        <button id=\"duelNow\">Run Duel Now</button>
+        <button id=\"duelNow\">Claw Battle</button>
         <span class=\"meta\" id=\"duelMsg\"></span>
       </div>
+      <div class=\"meta\" id=\"duelScore\" style=\"margin-top:8px\"></div>
       <div class=\"meta\" id=\"duelRules\" style=\"margin-top:8px\"></div>
       <div id=\"duelFeed\" style=\"margin-top:10px; display:grid; gap:6px; max-height:180px; overflow:auto;\"></div>
     </div>
@@ -1897,6 +1996,7 @@ def index():
     const duelMsg = document.getElementById('duelMsg');
     const duelFeed = document.getElementById('duelFeed');
     const duelRules = document.getElementById('duelRules');
+    const duelScore = document.getElementById('duelScore');
     const gameMode = document.getElementById('gameMode');
     const pairClear = document.getElementById('pairClear');
     const gameMsg = document.getElementById('gameMsg');
@@ -2417,7 +2517,15 @@ def index():
         if (document.activeElement !== duelInterval) {
           duelInterval.value = data.interval_seconds;
         }
-        duelRules.textContent = `Rules: random winner (50/50). Loser removal chance: ${Math.round((data.remove_chance || 0) * 100)}%. Services: ${(data.services || []).join(' vs ')}`;
+        const services = (data.services || []).slice(0,2);
+        const score = data.battle_score || {};
+        const svcScores = score.services || {};
+        if (services.length >= 2) {
+          duelScore.textContent = `Scoreboard — ${services[0]}: ${svcScores[services[0]] || 0} | ${services[1]}: ${svcScores[services[1]] || 0} | rounds: ${score.rounds || 0}`;
+        } else {
+          duelScore.textContent = 'Scoreboard unavailable';
+        }
+        duelRules.textContent = `Rules: manager captains pick fighters, arena decides winner (50/50), loser removal attempted. Services: ${(data.services || []).join(' vs ')}`;
 
         const rows = (data.events || []).slice(-10).reverse();
         duelFeed.innerHTML = '';
@@ -2432,10 +2540,12 @@ def index():
           const c = ev.challenger?.name || 'challenger';
           const d = ev.defender?.name || 'defender';
           const w = ev.winner?.name || 'winner';
-          row.textContent = `[${when}] ${c} challenged ${d} → WIN: ${w}${ev.loser_removed ? ' (loser removed)' : ' (loser spared)'}`;
+          const capA = ev.captains?.a?.name || 'Captain A';
+          const capB = ev.captains?.b?.name || 'Captain B';
+          row.textContent = `[${when}] ${capA} picked ${c} vs ${capB} picked ${d} → WIN: ${w}${ev.loser_removed ? ' (loser removed)' : ' (remove failed)'}`;
           duelFeed.appendChild(row);
         }
-        if (!rows.length) duelFeed.innerHTML = '<div class="meta">No duels yet.</div>';
+        if (!rows.length) duelFeed.innerHTML = '<div class="meta">No claw battles yet.</div>';
       } catch (e) {
         duelMsg.textContent = e.message;
       }
@@ -2467,12 +2577,12 @@ def index():
 
     duelNow.addEventListener('click', async () => {
       duelNow.disabled = true;
-      duelMsg.textContent = 'Launching duel...';
+      duelMsg.textContent = 'Launching claw battle...';
       try {
         const res = await fetch('/api/duel/now', { method: 'POST' });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Failed to run duel');
-        duelMsg.textContent = 'Duel complete';
+        duelMsg.textContent = 'Claw battle complete';
         await loadDuel();
       } catch (e) {
         duelMsg.textContent = e.message;
