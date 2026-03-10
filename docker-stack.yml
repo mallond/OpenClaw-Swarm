@@ -33,7 +33,7 @@ services:
         condition: any
 
   clawbucket-aggregator:
-    image: mallond/clawbucket:latest
+    image: mallond/clawbucket:arm-agg-local
     command: ["python", "aggregator.py"]
     ports:
       - "8090:8090"
@@ -46,7 +46,7 @@ services:
         condition: any
 
   clawbucket:
-    image: mallond/clawbucket:latest
+    image: mallond/clawbucket:arm-agg-local
     ports:
       - "8080:8080"
     environment:

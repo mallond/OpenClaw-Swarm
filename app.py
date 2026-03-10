@@ -40,6 +40,7 @@ PICOCLAW_URL = os.environ.get("PICOCLAW_URL", "http://picoclaw:18790/v1/chat/com
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "smollm2:135m")
 THREE_WORDS_PREFIX = "clawbucket:picoclaw:threewords:"
+THREE_WORDS_SHARED_KEY = "clawbucket:picoclaw:threewords:latest"
 THREE_WORDS_INTERVAL_SECONDS = 30
 THREE_WORDS_TTL_SECONDS = 120
 
@@ -338,6 +339,7 @@ def save_task_three_words(task_id: str, text: str):
     try:
         client = memcache_client()
         client.set(three_words_key(task_id), json.dumps(rec), expire=THREE_WORDS_TTL_SECONDS)
+        client.set(THREE_WORDS_SHARED_KEY, json.dumps(rec), expire=THREE_WORDS_TTL_SECONDS)
     except Exception:
         pass
     finally:
@@ -619,7 +621,25 @@ def fetch_three_words_via_picoclaw_exec() -> str:
         if not cands:
             return ""
         picoclaw_ctr = cands[0]
-        cmd = ["picoclaw", "agent", "-m", "Reply with exactly three words, lowercase, no punctuation."]
+
+        themes = [
+            "distributed systems",
+            "swarm cluster",
+            "container life",
+            "robot teamwork",
+            "memcached signals",
+            "replica chaos",
+            "tiny ai",
+            "leader election",
+        ]
+        nonce = int(time.time())
+        theme = themes[nonce % len(themes)]
+        prompt = (
+            f"Write exactly three different lowercase words about {theme}. "
+            f"No punctuation, no numbers, no explanation. nonce {nonce}."
+        )
+
+        cmd = ["picoclaw", "agent", "-m", prompt]
         code, out = picoclaw_ctr.exec_run(cmd, stdout=True, stderr=False)
         if code != 0:
             return ""
@@ -631,8 +651,57 @@ def fetch_three_words_via_picoclaw_exec() -> str:
         candidate = re.sub(r"[^a-zA-Z\s-]", "", candidate).strip().lower()
         words = [w for w in re.split(r"\s+", candidate) if w]
         if len(words) >= 3:
-            return " ".join(words[:3])
+            uniq = []
+            for w in words:
+                if w not in uniq:
+                    uniq.append(w)
+                if len(uniq) == 3:
+                    break
+            if len(uniq) == 3:
+                return " ".join(uniq)
         return ""
+    except Exception:
+        return ""
+
+
+def fetch_three_words_via_ollama() -> str:
+    themes = [
+        "distributed systems",
+        "swarm cluster",
+        "container life",
+        "robot teamwork",
+        "memcached signals",
+        "replica chaos",
+        "tiny ai",
+        "leader election",
+    ]
+    nonce = int(time.time())
+    theme = themes[nonce % len(themes)]
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": f"Write exactly three different lowercase words about {theme}. No punctuation. No explanation. nonce {nonce}.",
+        "stream": False,
+    }
+    req = urlrequest.Request(
+        OLLAMA_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8")
+        data = json.loads(raw)
+        candidate = (data.get("response") or "").strip().lower()
+        candidate = re.sub(r"[^a-zA-Z\s-]", "", candidate).strip()
+        words = [w for w in re.split(r"\s+", candidate) if w]
+        uniq = []
+        for w in words:
+            if w not in uniq:
+                uniq.append(w)
+            if len(uniq) == 3:
+                break
+        return " ".join(uniq) if len(uniq) == 3 else ""
     except Exception:
         return ""
 
@@ -641,10 +710,11 @@ def three_words_loop():
     while True:
         try:
             task_id = task_id_for_keys()
-            if task_id and task_id != "unknown":
-                text = fetch_three_words_via_picoclaw_exec()
-                if text:
-                    save_task_three_words(task_id, text)
+            text = fetch_three_words_via_picoclaw_exec()
+            if not text:
+                text = fetch_three_words_via_ollama()
+            if text and task_id and task_id != "unknown":
+                save_task_three_words(task_id, text)
         except Exception:
             pass
         time.sleep(THREE_WORDS_INTERVAL_SECONDS)
