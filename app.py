@@ -2373,7 +2373,9 @@ def index():
           const pairBtnText = activePair ? 'Paired' : (isSelected ? 'Selected' : 'Pair');
           const pairBtnDisabled = activePair ? 'disabled' : '';
           const opponentId = activePair ? (activePair.task_a.task_id === r.id ? activePair.task_b.task_id : activePair.task_a.task_id) : null;
-          const matchupLine = activePair ? `<p><strong>Matchup:</strong> vs ${taskLabel(opponentId)}</p>` : '';
+          const matchupLine = activePair
+            ? `<p><strong>Matchup:</strong> vs ${taskLabel(opponentId)}</p>`
+            : `<p><strong>Matchup:</strong> none</p>`;
           el.innerHTML = `
             <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}
             <h3>${r.name}</h3>
