@@ -496,7 +496,7 @@ def read_rps_state():
 
 
 def fetch_haiku_via_picoclaw():
-    prompt = "Write exactly one short 3-line haiku about distributed systems. Output only the poem."
+    prompt = "Write exactly one short 3-line haiku about distributed systems in a Starship Troopers military propaganda tone. Keep it punchy. Output only the poem."
     try:
         proc = subprocess.run(
             ["picoclaw", "agent", "-m", prompt],
@@ -520,7 +520,7 @@ def fetch_haiku_via_picoclaw():
 def fetch_haiku_via_ollama():
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": "Write exactly one short 3-line haiku about distributed systems. Output only the poem.",
+        "prompt": "Write exactly one short 3-line haiku about distributed systems in a Starship Troopers military propaganda tone. Keep it punchy. Output only the poem.",
         "stream": False,
     }
     req = urlrequest.Request(
@@ -616,7 +616,7 @@ def fetch_three_words_via_picoclaw_exec() -> str:
         nonce = int(time.time())
         theme = themes[nonce % len(themes)]
         prompt = (
-            f"Write exactly three different lowercase words about {theme}. "
+            f"Write exactly three different lowercase words about {theme}, in a starship troopers military tone. "
             f"No punctuation, no numbers, no explanation. nonce {nonce}."
         )
 
@@ -667,7 +667,7 @@ def fetch_three_words_via_ollama() -> str:
     theme = themes[nonce % len(themes)]
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": f"Write exactly three different lowercase words about {theme}. No punctuation. No explanation. nonce {nonce}.",
+        "prompt": f"Write exactly three different lowercase words about {theme}, in a starship troopers military tone. No punctuation. No explanation. nonce {nonce}.",
         "stream": False,
     }
     req = urlrequest.Request(
