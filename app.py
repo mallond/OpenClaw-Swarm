@@ -15,6 +15,17 @@ import docker
 from docker.errors import DockerException, NotFound
 from pymemcache.client.base import Client as MemcacheClient
 
+from game_engine import (
+    TaskRef,
+    append_pair_chat,
+    create_pair,
+    lock_pair_move,
+    maybe_resolve_pair,
+    pair_from_dict,
+    pair_to_dict,
+    validate_pair,
+)
+
 app = Flask(__name__)
 
 STARTED_AT = datetime.now(timezone.utc).isoformat()
@@ -52,6 +63,10 @@ THREE_WORDS_PREFIX = "clawbucket:picoclaw:threewords:"
 THREE_WORDS_SHARED_KEY = "clawbucket:picoclaw:threewords:latest"
 THREE_WORDS_INTERVAL_SECONDS = 30
 THREE_WORDS_TTL_SECONDS = 120
+
+GAME_PAIRS_KEY = "clawbucket:game:pairs"
+GAME_EVENTS_KEY = "clawbucket:game:events"
+GAME_EVENTS_LIMIT = 500
 
 
 def color_from_text(text: str) -> str:
@@ -339,6 +354,120 @@ def append_duel_event(event: dict):
                 client.close()
         except Exception:
             pass
+
+
+def load_game_pairs() -> dict:
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(GAME_PAIRS_KEY)
+        if not raw:
+            return {}
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    return {}
+
+
+def save_game_pairs(pairs: dict):
+    client = None
+    try:
+        client = memcache_client()
+        client.set(GAME_PAIRS_KEY, json.dumps(pairs), expire=86400)
+    except Exception:
+        return False
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    return True
+
+
+def load_game_events() -> list:
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(GAME_EVENTS_KEY)
+        if not raw:
+            return []
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data[-GAME_EVENTS_LIMIT:]
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    return []
+
+
+def append_game_event(event_type: str, payload: dict):
+    items = load_game_events()
+    items.append({
+        "id": hashlib.md5(f"{event_type}:{time.time()}".encode("utf-8")).hexdigest()[:12],
+        "type": event_type,
+        "at": datetime.now(timezone.utc).isoformat(),
+        "payload": payload,
+    })
+    items = items[-GAME_EVENTS_LIMIT:]
+    client = None
+    try:
+        client = memcache_client()
+        client.set(GAME_EVENTS_KEY, json.dumps(items), expire=86400)
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+
+
+def list_alive_task_refs() -> dict:
+    refs = {}
+    for svc in SWARM_SERVICES or [SERVICE_NAME]:
+        try:
+            for row in list_running_task_rows(svc):
+                refs[row["id"]] = TaskRef(
+                    service=svc,
+                    task_id=row["id"],
+                    name=row.get("name") or generated_name(row["id"]),
+                    slot=int(row.get("slot") or 0),
+                )
+        except Exception:
+            continue
+    return refs
+
+
+def eliminate_task(task_id: str) -> bool:
+    for svc in SWARM_SERVICES or [SERVICE_NAME]:
+        try:
+            for row in list_running_task_rows(svc):
+                if row.get("id") == task_id and row.get("container_id"):
+                    ctr = docker_client().containers.get(row["container_id"])
+                    ctr.kill()
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def is_this_task_on_leader_manager() -> bool:
@@ -1231,6 +1360,236 @@ def api_duel_now_post():
     if not ev:
         return jsonify({"error": "unable to run duel (need two swarms with running tasks)"}), 409
     return jsonify({"ok": True, "event": ev}), 201
+
+
+@app.get("/api/game/state")
+def api_game_state_get():
+    raw_pairs = load_game_pairs()
+    alive_refs = list_alive_task_refs()
+    alive_ids = set(alive_refs.keys())
+
+    active = []
+    resolved = []
+    paired_task_ids = set()
+
+    changed = False
+    for pair_id, data in raw_pairs.items():
+        try:
+            pair = pair_from_dict(data)
+        except Exception:
+            changed = True
+            continue
+
+        if pair.status != "resolved":
+            res = maybe_resolve_pair(pair)
+            if res:
+                changed = True
+                append_game_event("pair.resolved", {"pair_id": pair.pair_id, "resolution": pair_to_dict(pair).get("resolution")})
+                for loser_id in (res.eliminated_task_ids or []):
+                    eliminate_task(loser_id)
+
+        rec = pair_to_dict(pair)
+        raw_pairs[pair_id] = rec
+
+        if pair.status == "resolved":
+            resolved.append(rec)
+        elif pair.status in {"paired", "negotiating", "locked"}:
+            active.append(rec)
+            paired_task_ids.add(pair.task_a.task_id)
+            paired_task_ids.add(pair.task_b.task_id)
+
+    if changed:
+        save_game_pairs(raw_pairs)
+
+    return jsonify({
+        "active_pairs": active,
+        "resolved_pairs": resolved[-50:],
+        "events": load_game_events(),
+        "alive_tasks": [
+            {
+                "task_id": r.task_id,
+                "service": r.service,
+                "name": r.name,
+                "slot": r.slot,
+                "paired": r.task_id in paired_task_ids,
+            }
+            for r in alive_refs.values()
+        ],
+    })
+
+
+@app.post("/api/game/pair")
+def api_game_pair_post():
+    data = request.get_json(silent=True) or {}
+    task_a_id = (data.get("task_a") or "").strip()
+    task_b_id = (data.get("task_b") or "").strip()
+    game = (data.get("game") or "prisoners_dilemma").strip().lower()
+    settings = data.get("settings") if isinstance(data.get("settings"), dict) else None
+
+    if game not in {"prisoners_dilemma", "ultimatum", "contract"}:
+        return jsonify({"error": "game must be one of: prisoners_dilemma, ultimatum, contract"}), 400
+
+    refs = list_alive_task_refs()
+    task_a = refs.get(task_a_id)
+    task_b = refs.get(task_b_id)
+    if not task_a or not task_b:
+        return jsonify({"error": "both tasks must be alive"}), 400
+
+    raw_pairs = load_game_pairs()
+    paired_ids = set()
+    for rec in raw_pairs.values():
+        try:
+            p = pair_from_dict(rec)
+            if p.status in {"paired", "negotiating", "locked"}:
+                paired_ids.add(p.task_a.task_id)
+                paired_ids.add(p.task_b.task_id)
+        except Exception:
+            continue
+
+    ok, err = validate_pair(task_a, task_b, alive_task_ids=set(refs.keys()), active_paired_task_ids=paired_ids)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    proposer = (data.get("proposer_task_id") or "").strip() or None
+    pair = create_pair(task_a, task_b, game, settings=settings, proposer_task_id=proposer)
+    raw_pairs[pair.pair_id] = pair_to_dict(pair)
+
+    if not save_game_pairs(raw_pairs):
+        return jsonify({"error": "memcached unavailable"}), 503
+
+    append_game_event("pair.created", {"pair_id": pair.pair_id, "game": pair.game, "task_a": task_a.task_id, "task_b": task_b.task_id})
+    return jsonify({"ok": True, "pair": pair_to_dict(pair)}), 201
+
+
+@app.post("/api/game/unpair")
+def api_game_unpair_post():
+    data = request.get_json(silent=True) or {}
+    pair_id = (data.get("pair_id") or "").strip()
+    if not pair_id:
+        return jsonify({"error": "pair_id is required"}), 400
+
+    raw_pairs = load_game_pairs()
+    rec = raw_pairs.get(pair_id)
+    if not rec:
+        return jsonify({"error": "pair not found"}), 404
+
+    pair = pair_from_dict(rec)
+    if pair.status == "resolved":
+        return jsonify({"error": "pair already resolved"}), 409
+
+    pair.status = "canceled"
+    raw_pairs[pair_id] = pair_to_dict(pair)
+    save_game_pairs(raw_pairs)
+    append_game_event("pair.canceled", {"pair_id": pair_id})
+    return jsonify({"ok": True, "pair": pair_to_dict(pair)})
+
+
+@app.post("/api/game/chat")
+def api_game_chat_post():
+    data = request.get_json(silent=True) or {}
+    pair_id = (data.get("pair_id") or "").strip()
+    from_task = (data.get("from_task") or "").strip()
+    text = (data.get("text") or "").strip()
+    if not pair_id or not from_task or not text:
+        return jsonify({"error": "pair_id, from_task, and text are required"}), 400
+
+    raw_pairs = load_game_pairs()
+    rec = raw_pairs.get(pair_id)
+    if not rec:
+        return jsonify({"error": "pair not found"}), 404
+
+    pair = pair_from_dict(rec)
+    if pair.status == "resolved":
+        return jsonify({"error": "pair already resolved"}), 409
+
+    try:
+        msg = append_pair_chat(pair, from_task, text)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    raw_pairs[pair_id] = pair_to_dict(pair)
+    save_game_pairs(raw_pairs)
+    append_game_event("chat.message", {"pair_id": pair_id, "message": msg.__dict__})
+    return jsonify({"ok": True, "message": msg.__dict__}), 201
+
+
+@app.get("/api/game/chat")
+def api_game_chat_get():
+    pair_id = (request.args.get("pair_id") or "").strip()
+    if not pair_id:
+        return jsonify({"error": "pair_id is required"}), 400
+
+    raw_pairs = load_game_pairs()
+    rec = raw_pairs.get(pair_id)
+    if not rec:
+        return jsonify({"error": "pair not found"}), 404
+
+    pair = pair_from_dict(rec)
+    return jsonify({"pair_id": pair_id, "messages": [m.__dict__ for m in pair.chat]})
+
+
+@app.post("/api/game/move")
+def api_game_move_post():
+    data = request.get_json(silent=True) or {}
+    pair_id = (data.get("pair_id") or "").strip()
+    task_id = (data.get("task") or "").strip()
+    move = data.get("move")
+    if not pair_id or not task_id or not isinstance(move, dict):
+        return jsonify({"error": "pair_id, task, and move object are required"}), 400
+
+    raw_pairs = load_game_pairs()
+    rec = raw_pairs.get(pair_id)
+    if not rec:
+        return jsonify({"error": "pair not found"}), 404
+
+    pair = pair_from_dict(rec)
+    try:
+        mv = lock_pair_move(pair, task_id, move)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    resolution = maybe_resolve_pair(pair)
+    if resolution:
+        append_game_event("pair.resolved", {"pair_id": pair_id, "resolution": pair_to_dict(pair).get("resolution")})
+        for loser_id in (resolution.eliminated_task_ids or []):
+            eliminate_task(loser_id)
+    else:
+        append_game_event("move.locked", {"pair_id": pair_id, "task": task_id})
+
+    raw_pairs[pair_id] = pair_to_dict(pair)
+    save_game_pairs(raw_pairs)
+    return jsonify({
+        "ok": True,
+        "move": mv.__dict__,
+        "status": pair.status,
+        "resolution": pair_to_dict(pair).get("resolution"),
+    }), 201
+
+
+@app.post("/api/game/resolve")
+def api_game_resolve_post():
+    data = request.get_json(silent=True) or {}
+    pair_id = (data.get("pair_id") or "").strip()
+    if not pair_id:
+        return jsonify({"error": "pair_id is required"}), 400
+
+    raw_pairs = load_game_pairs()
+    rec = raw_pairs.get(pair_id)
+    if not rec:
+        return jsonify({"error": "pair not found"}), 404
+
+    pair = pair_from_dict(rec)
+    resolution = maybe_resolve_pair(pair)
+    if not resolution:
+        return jsonify({"error": "pair not ready to resolve"}), 409
+
+    for loser_id in (resolution.eliminated_task_ids or []):
+        eliminate_task(loser_id)
+
+    raw_pairs[pair_id] = pair_to_dict(pair)
+    save_game_pairs(raw_pairs)
+    append_game_event("pair.resolved", {"pair_id": pair_id, "resolution": pair_to_dict(pair).get("resolution")})
+    return jsonify({"ok": True, "pair": pair_to_dict(pair)})
 
 
 @app.post("/api/rps/config")
