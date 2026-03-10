@@ -1736,6 +1736,19 @@ def index():
       color: #d9e6ff;
       min-height: 1.3rem;
     }
+    .pair-btn {
+      margin-top: 8px;
+      margin-left: 8px;
+      border: 1px solid #4d5f8e;
+      background: #1d2746;
+      color: #fff;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .pair-btn.selected { background: #5a2d8a; border-color: #9d69d8; }
+    .pair-btn.paired { background: #2f3d60; border-color: #6b7aa1; opacity: .8; }
   </style>
 </head>
 <body>
@@ -1779,6 +1792,22 @@ def index():
     </div>
 
     <div class=\"panel\" style=\"margin-top:16px\">
+      <div class=\"row\"><strong>Cross-Swarm Pair Game</strong></div>
+      <div class=\"row\" style=\"margin-top:10px\">
+        <label for=\"gameMode\">Mode:</label>
+        <select id=\"gameMode\">
+          <option value=\"prisoners_dilemma\">Prisoner's Dilemma</option>
+          <option value=\"ultimatum\">Ultimatum</option>
+          <option value=\"contract\">Contract</option>
+        </select>
+        <button id=\"pairClear\">Clear Selection</button>
+        <span class=\"meta\" id=\"gameMsg\"></span>
+      </div>
+      <div class=\"meta\" id=\"gameSelection\" style=\"margin-top:8px\">Select first task, then second task from the other swarm.</div>
+      <div id=\"gameFeed\" style=\"margin-top:10px; display:grid; gap:6px; max-height:180px; overflow:auto;\"></div>
+    </div>
+
+    <div class=\"panel\" style=\"margin-top:16px\">
       <div class=\"row\">
         <strong>Container Conversation (Memcached simulation)</strong>
       </div>
@@ -1808,8 +1837,15 @@ def index():
     const duelMsg = document.getElementById('duelMsg');
     const duelFeed = document.getElementById('duelFeed');
     const duelRules = document.getElementById('duelRules');
+    const gameMode = document.getElementById('gameMode');
+    const pairClear = document.getElementById('pairClear');
+    const gameMsg = document.getElementById('gameMsg');
+    const gameSelection = document.getElementById('gameSelection');
+    const gameFeed = document.getElementById('gameFeed');
     const TILE_TOGGLE_KEY = 'clawbucket.tileToggles';
     const pendingTargets = {};
+    let selectedPairTask = null;
+    let gameState = { active_pairs: [], resolved_pairs: [], alive_tasks: [] };
 
     function loadTileToggles() {
       try {
@@ -1841,7 +1877,7 @@ def index():
       if (armBtn) armBtn.classList.toggle('on', isOn);
     }
 
-    document.addEventListener('click', (event) => {
+    document.addEventListener('click', async (event) => {
       const outageBtn = event.target.closest('.outage-btn');
       if (outageBtn) {
         const tile = outageBtn.closest('.chip');
@@ -1861,6 +1897,68 @@ def index():
         return;
       }
 
+      const pairBtn = event.target.closest('.pair-btn');
+      if (pairBtn) {
+        const tile = pairBtn.closest('.chip');
+        if (!tile) return;
+        const taskId = tile.dataset.taskId;
+        const service = tile.dataset.service;
+        if (!taskId || !service) return;
+
+        if (!selectedPairTask) {
+          selectedPairTask = taskId;
+          gameMsg.textContent = 'First task selected. Choose a task from the other swarm.';
+          gameSelection.textContent = `Selected: ${taskLabel(taskId)}`;
+          renderSwarms(window.__lastSwarms || []);
+          return;
+        }
+
+        if (selectedPairTask === taskId) {
+          selectedPairTask = null;
+          gameMsg.textContent = 'Selection cleared.';
+          gameSelection.textContent = 'Select first task, then second task from the other swarm.';
+          renderSwarms(window.__lastSwarms || []);
+          return;
+        }
+
+        const firstTask = (gameState.alive_tasks || []).find(t => t.task_id === selectedPairTask);
+        const secondTask = (gameState.alive_tasks || []).find(t => t.task_id === taskId);
+        if (!firstTask || !secondTask) {
+          selectedPairTask = null;
+          gameMsg.textContent = 'Tasks changed; please try pairing again.';
+          gameSelection.textContent = 'Select first task, then second task from the other swarm.';
+          await loadGame();
+          await loadState();
+          return;
+        }
+        if (firstTask.service === secondTask.service) {
+          gameMsg.textContent = 'Pick second task from the other swarm.';
+          return;
+        }
+
+        pairBtn.disabled = true;
+        gameMsg.textContent = 'Creating pair...';
+        try {
+          const res = await fetch('/api/game/pair', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ task_a: selectedPairTask, task_b: taskId, game: gameMode.value }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Pair failed');
+          gameMsg.textContent = `Pair created: ${data.pair.pair_id}`;
+          selectedPairTask = null;
+          gameSelection.textContent = 'Select first task, then second task from the other swarm.';
+          await loadGame();
+          await loadState();
+        } catch (e) {
+          gameMsg.textContent = e.message;
+        } finally {
+          pairBtn.disabled = false;
+        }
+        return;
+      }
+
       const armBtn = event.target.closest('.arm-btn');
       if (!armBtn) return;
       const tile = armBtn.closest('.chip');
@@ -1877,6 +1975,40 @@ def index():
         body: JSON.stringify({ task_id: taskId, bot: botName, state: nowOn ? 'on' : 'off' }),
       }).catch(() => {});
     });
+
+    function taskLabel(taskId) {
+      const t = (gameState.alive_tasks || []).find(x => x.task_id === taskId);
+      if (!t) return String(taskId || '').slice(0, 12);
+      return `${t.name} (${t.service}#${t.slot})`;
+    }
+
+    function pairMap() {
+      const m = {};
+      for (const p of gameState.active_pairs || []) {
+        m[p.task_a.task_id] = p;
+        m[p.task_b.task_id] = p;
+      }
+      return m;
+    }
+
+    function renderGameFeed() {
+      const rows = (gameState.resolved_pairs || []).slice(-10).reverse();
+      gameFeed.innerHTML = '';
+      for (const p of rows) {
+        const row = document.createElement('div');
+        row.className = 'meta';
+        row.style.padding = '6px 8px';
+        row.style.border = '1px solid #2b3a67';
+        row.style.borderRadius = '8px';
+        row.style.background = '#0f1730';
+        const r = p.resolution || {};
+        const when = String(p.resolved_at || p.created_at || '').slice(11, 19);
+        const loser = (r.eliminated_task_ids || []).length ? ` | removed: ${(r.eliminated_task_ids || []).map(taskLabel).join(', ')}` : '';
+        row.textContent = `[${when}] ${p.game}: ${taskLabel(p.task_a.task_id)} vs ${taskLabel(p.task_b.task_id)} → ${r.reason || 'resolved'}${loser}`;
+        gameFeed.appendChild(row);
+      }
+      if (!rows.length) gameFeed.innerHTML = '<div class="meta">No resolved pair games yet.</div>';
+    }
 
     async function scaleService(serviceName, replicas, msgEl, btnEl, inputEl) {
       if (!Number.isInteger(replicas) || replicas < 1 || replicas > 25) {
@@ -1910,6 +2042,7 @@ def index():
 
     function renderSwarms(swarms) {
       const toggles = loadTileToggles();
+      const pMap = pairMap();
       swarmPanels.innerHTML = '';
       for (const s of swarms || []) {
         const panel = document.createElement('div');
@@ -1948,9 +2081,15 @@ def index():
           el.className = `chip ${r.is_manager ? 'manager' : ''}`;
           el.dataset.taskId = r.id;
           el.dataset.botName = r.name;
+          el.dataset.service = s.service;
           el.style.setProperty('--chip-color', r.color);
           const scoreClass = (r.score || 0) < 0 ? 'negative' : 'positive';
           const scoreText = (r.score || 0) > 0 ? `+${r.score}` : `${r.score || 0}`;
+          const activePair = pMap[r.id];
+          const isSelected = selectedPairTask === r.id;
+          const pairBtnClass = `pair-btn ${isSelected ? 'selected' : ''} ${activePair ? 'paired' : ''}`.trim();
+          const pairBtnText = activePair ? 'Paired' : (isSelected ? 'Selected' : 'Pair');
+          const pairBtnDisabled = activePair ? 'disabled' : '';
           el.innerHTML = `
             <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}
             <h3>${r.name}</h3>
@@ -1959,6 +2098,7 @@ def index():
             <p><strong>Task:</strong> ${String(r.id || '').slice(0, 12)}</p>
             <p><strong>Node:</strong> ${String(r.node_id || '').slice(0, 12)}</p>
             <button type="button" class="arm-btn">Arm</button>
+            <button type="button" class="${pairBtnClass}" ${pairBtnDisabled}>${pairBtnText}</button>
             ${r.is_manager ? '<button type="button" class="outage-btn" style="margin-top:8px;margin-left:8px;border:1px solid #b24a4a;background:#4a1d1d;color:#fff;border-radius:8px;padding:6px 10px;font-weight:700;cursor:pointer;">Outage</button>' : ''}
             <div class="threewords">${r.three_words || ''}</div>
           `;
@@ -2159,22 +2299,48 @@ def index():
       }
     });
 
+    async function loadGame() {
+      try {
+        const res = await fetch('/api/game/state');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Game unavailable');
+        gameState = data || { active_pairs: [], resolved_pairs: [], alive_tasks: [] };
+        renderGameFeed();
+      } catch (e) {
+        gameMsg.textContent = e.message;
+      }
+    }
+
+    pairClear.addEventListener('click', () => {
+      selectedPairTask = null;
+      gameMsg.textContent = 'Selection cleared.';
+      gameSelection.textContent = 'Select first task, then second task from the other swarm.';
+      renderSwarms(window.__lastSwarms || []);
+    });
+
+    gameMode.addEventListener('change', () => {
+      gameMsg.textContent = `Mode set: ${gameMode.value}`;
+    });
+
     async function loadState() {
       try {
         const res = await fetch('/api/swarms');
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Unable to load swarms');
-        renderSwarms(data.swarms || []);
+        window.__lastSwarms = data.swarms || [];
+        renderSwarms(window.__lastSwarms);
       } catch (e) {
         swarmPanels.innerHTML = `<div class="panel"><div class="meta">${e.message}</div></div>`;
       }
     }
 
+    loadGame();
     loadState();
     loadChat();
     loadHaiku();
     loadRps();
     loadDuel();
+    setInterval(loadGame, 3000);
     setInterval(loadState, 3000);
     setInterval(loadChat, 4000);
     setInterval(loadHaiku, 5000);
