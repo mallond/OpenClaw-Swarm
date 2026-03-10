@@ -1,221 +1,168 @@
 # clawbucket
 
-**Bob's World** is now a Docker Swarm simulation game platform:
+**Bob's World** is now a Docker Swarm simulation platform for coordinating many AI-enabled replicas.
+
+## Highlights (current)
 
 - Swarm replica tiles with per-tile ARM state
-- Manager/leader visualization
+- Leader/manager visualization and deterministic election
 - Memcached-backed inter-container signaling
-- Leader-published Rock/Paper/Scissors (RPS) rounds
-- Non-leader player scoring with live tile display
-- Aggregator API for scoreboard + current ON/OFF state
-- Ollama service for local model pulls/tests (`smollm2:135m`)
-
-This README captures the current behavior in detail so we can evolve it safely and eventually extract a formal `SKILL.md`.
-
----
-
-## 1) What this system does
-
-### Core concept
-A Swarm service (`clawbucket`) runs multiple replicas. The UI shows one tile per running task. Containers coordinate through Memcached to simulate lightweight distributed game behavior.
-
-### Current features
-
-1. **Swarm dashboard (port 8080)**
-   - Shows running replicas (`slot`, short `task id`, short `node id`, generated name)
-   - Scale control (`/api/scale`) with desired/running status
-
-2. **ARM toggles per tile**
-   - Each tile has an `Arm` button
-   - OFF = default style
-   - ON = green button + green ON status pill
-   - Every arm toggle emits an event to Memcached (`on` / `off`)
-
-3. **Single manager tile highlight**
-   - Exactly one tile is marked `MANAGER`
-   - Selection follows Swarm leader-aware rule with deterministic fallback
-
-4. **Container conversation (simulation)**
-   - UI panel posts/reads chat messages from Memcached
-
-5. **Task heartbeats**
-   - Each task writes periodic liveness text to Memcached:
-     - `Ping from <task name> at <timestamp>`
-   - Interval: every 10s
-   - TTL: 20s
-
-6. **RPS leader broadcast + players**
-   - Exactly one elected publisher task writes R/P/S choice to Memcached
-   - Interval configurable from UI
-   - Non-manager tasks act as players:
-     - roll random rock/paper/scissors each round
-     - compare against latest leader move
-     - update per-task score (+1 win, -1 loss, 0 tie)
-
-7. **Aggregator service (port 8090)**
-   - Reads ARM events from Memcached
-   - Exposes scoreboard with:
-     - counts (`on`, `off`, `toggles`)
-     - cumulative `score`
-     - `current_on_state`
-     - `last_state`, `last_event_at`
-
-8. **Ollama model service (port 11434)**
-   - Dedicated service for local LLM runtime in Swarm
-   - Persistent model storage via named volume
-   - Verified model: `smollm2:135m`
+- Leader-published Rock/Paper/Scissors (RPS) rounds with per-task scoring
+- Aggregator API for scoreboard + ON/OFF state
+- **OpenClaw/PicoClaw collaboration model**:
+  - each `clawbucket` task includes its **own local PicoClaw runtime/context**
+  - all tasks share a single **Ollama** backend for local model inference/fallback
+- Starship Troopers-style generation prompts (unit flavor)
 
 ---
 
-## 2) Architecture
+## 1) Core idea
 
-### Services
+`clawbucket` runs as a replicated Swarm service. Each replica is both:
+
+1. A participant in the simulation loop (heartbeat, RPS player/publisher, ARM events)
+2. Its own lightweight AI agent runtime (local PicoClaw CLI + local context)
+
+This allows **one-to-many scaling** of OpenClaw-style behavior:
+- one container = one autonomous trooper
+- many containers = coordinated AI squad/army
+
+In short: **OpenClaw can run an army of one or many.**
+
+---
+
+## 2) OpenClaw + PicoClaw collaboration design
+
+### Before
+A single shared `picoclaw` service handled generation requests for all tasks.
+
+### Now
+Each `clawbucket` task image embeds PicoClaw directly:
+
+- `Dockerfile` copies `/usr/local/bin/picoclaw` from `sipeed/picoclaw:latest`
+- task-local config at `/root/.picoclaw/config.json`
+- `app.py` calls `picoclaw agent -m ...` via subprocess in the same container
+
+### Why this matters
+
+- **Isolated context per task** (no single shared chat/context window)
+- Better swarm identity (each replica has its own voice/history/runtime state)
+- Fewer cross-service hops for agent calls
+- Shared model economics still preserved through common `ollama` service
+
+This gives a practical hybrid:
+- **distributed agents** at the edge (per task)
+- **shared model backend** in the center (Ollama)
+
+---
+
+## 3) Services and topology
 
 Defined in `docker-stack.yml`:
 
 - `clawbucket`
-  - Flask app (`app.py`), UI + APIs
+  - Flask app (`app.py`) + local PicoClaw binary
   - Exposes `8080`
-  - Mounts Docker socket for Swarm state/scale APIs
+  - Mounts Docker socket for Swarm inspection/scale operations
 
 - `clawbucket-aggregator`
   - Flask app (`aggregator.py`)
   - Exposes `8090`
 
 - `memcached`
-  - Shared transient state bus
-  - Internal-only (no host port)
+  - Shared transient state bus for coordination
 
 - `ollama`
-  - Local inference/model service
+  - Shared model runtime
   - Exposes `11434`
-  - Uses volume `ollama_data` for model persistence
+  - Uses `ollama_data` volume for model persistence
 
-### Data flow
-
-1. User interacts with 8080 UI
-2. App writes/reads operational state from Swarm + Memcached
-3. Leader publisher emits shared RPS state
-4. Non-leader tasks consume RPS state and update scores
-5. Aggregator reads Memcached event streams and provides compact scoreboard API
+> Note: standalone shared `picoclaw` service is no longer required for generation flow.
 
 ---
 
-## 3) Memcached key map (current)
+## 4) Current behavior
+
+1. **Dashboard (`:8080`)**
+   - shows replicas, slot, short task/node IDs, generated names
+   - supports scaling via `/api/scale`
+
+2. **ARM toggles**
+   - per-tile arm button and ON/OFF visual state
+   - emits Memcached event stream (`on`/`off`)
+
+3. **Manager selection**
+   - exactly one `MANAGER` tile
+   - deterministic leader-aware selection
+
+4. **Conversation + generated text**
+   - chat panel backed by Memcached
+   - per-task generated short phrases stored by task key
+   - displayed text truncated to **50 chars**
+
+5. **RPS loop**
+   - single publisher task writes shared leader move
+   - non-manager tasks score against leader move
+
+6. **Haiku loop**
+   - periodic generated haiku with PicoClaw-first, Ollama-fallback behavior
+
+---
+
+## 5) Memcached keys (important)
 
 ### Chat
 - `clawbucket:chat:messages`
-  - JSON list of chat messages
 
 ### Arm events
 - `clawbucket:arm:events`
-  - JSON list of arm toggle events
 
 ### RPS
 - `clawbucket:rps:state`
-  - JSON object with latest leader choice + metadata
 - `clawbucket:rps:interval_seconds`
-  - current configured round interval
 
-### Player score state
+### Scores
 - `clawbucket:rps:score:<task_id>`
-  - integer score per player task
 - `clawbucket:rps:last_seen:<task_id>`
-  - last consumed RPS round id (timestamp) for idempotence
 
 ### Heartbeats
 - `clawbucket:heartbeat:<task_name>`
-  - heartbeat text (`Ping from ...`) with short TTL
 
-> Note: this is simulation-grade state handling, not production-grade locking/transactions.
+### Generated per-task text
+- `clawbucket:picoclaw:threewords:<task_id>` (primary per-instance value)
+- `clawbucket:picoclaw:threewords:latest` (shared latest snapshot)
 
 ---
 
-## 4) API reference
+## 6) API quick reference
 
-## Main app (`:8080`)
-
+Main app (`:8080`):
 - `GET /api/swarm`
-  - service replica state and tile metadata
-
 - `POST /api/scale`
-  - body: `{ "replicas": <int> }`
-
 - `GET /api/chat`
 - `POST /api/chat`
-  - body: `{ "text": "..." }`
-
 - `GET /api/arm/events`
 - `POST /api/arm`
-  - body: `{ "task_id": "...", "bot": "...", "state": "on|off" }`
-
 - `GET /api/rps`
-  - latest leader RPS state + configured interval
-
 - `POST /api/rps/config`
-  - body: `{ "interval_seconds": <int 2..120> }`
+- `GET /api/haiku`
 
-## Aggregator (`:8090`)
-
+Aggregator (`:8090`):
 - `GET /healthz`
 - `GET /api/scoreboard`
-  - ARM scoreboard + `current_on_state`
 
 ---
 
-## 5) UI behavior details
-
-### Tile behavior
-- One tile per running task
-- Manager tile:
-  - gold outline
-  - `MANAGER` badge
-  - no player score panel
-- Non-manager tiles:
-  - large score text
-  - green for zero/positive
-  - red for negative
-
-### Arm controls
-- Button text fixed as `Arm`
-- Button green only when ON
-- Top status pill green only when ON
-
-### RPS controls
-- Numeric interval input + apply button
-- Changes are stored in Memcached and affect all tasks
-
----
-
-## 6) Leader / manager election behavior in app
-
-The app uses Swarm metadata to derive a single manager/publisher tile deterministically.
-
-High-level rule:
-1. Find Swarm leader node
-2. Among running service tasks on that node, select lowest slot
-3. If no match, fallback to first running task by slot
-
-This same election logic is used to:
-- mark `is_manager` in tile API data
-- choose single RPS publisher
-
-All other tasks are treated as players.
-
----
-
-## 7) Deploy / update workflow
-
-From repo root:
+## 7) Deploy / update
 
 ```bash
-# build local image tag used by current stack
-docker build -t mallond/clawbucket:latest .
+# build image used by stack
+docker build -t mallond/clawbucket:arm-agg-local .
 
-# deploy/update stack
+# deploy/update
 docker stack deploy -c docker-stack.yml clawbucket
 
-# check services
+# verify
 docker service ls
 docker service ps clawbucket_clawbucket
 docker service ps clawbucket_clawbucket-aggregator
@@ -228,83 +175,60 @@ Open:
 - `http://<host>:8090/api/scoreboard`
 - `http://<host>:11434`
 
-### Ollama model load + test
+---
+
+## 8) Ollama model management
 
 ```bash
-# find ollama container from the swarm service
 OLLAMA_CID=$(docker ps --filter label=com.docker.swarm.service.name=clawbucket_ollama -q | head -n1)
 
-# pull model into persistent ollama_data volume
 docker exec -it "$OLLAMA_CID" ollama pull smollm2:135m
-
-# list models to confirm
-
 docker exec -it "$OLLAMA_CID" ollama list
-
-# quick generation test
-
 docker exec -it "$OLLAMA_CID" ollama run smollm2:135m "Reply with exactly OLLAMA_OK"
 ```
 
 ---
 
-## 8) Troubleshooting notes
+## 9) Troubleshooting
 
-### 8080 serves old UI
-- Ensure no extra local `python app.py` process is binding 8080 outside Swarm
-- Hard refresh browser (Cmd+Shift+R)
+### Repeated/identical generated text on all tiles
+- ensure per-task key path is active (`...threewords:<task_id>`)
+- confirm new image is deployed to all replicas
 
-### `memcached unavailable`
-- Verify `clawbucket_memcached` service is `1/1`
-- Confirm app and aggregator use correct host env (`MEMCACHED_HOST`)
-- Verify image actually contains latest `app.py`/`aggregator.py`
+### Missing APIs (404 on `/api/chat`, `/api/rps`, `/api/haiku`)
+- indicates mixed old/new tasks during rollout
+- wait for convergence or force update service
 
-### 8090 empty/404/failing
-- Check aggregator service exists and is healthy
-- Review logs:
-  - `docker service logs clawbucket_clawbucket-aggregator`
+### Aggregator failing
+- check logs: `docker service logs clawbucket_clawbucket-aggregator`
+- ensure image includes `aggregator.py`
 
-### Scores not updating
-- Confirm RPS state is changing via `GET /api/rps`
-- Confirm one publisher exists and non-manager tiles are present
-- Confirm player score keys are updating in Memcached
-
-### Ollama service not ready / model not found
-- Check service state: `docker service ps clawbucket_ollama`
-- If service is still `Preparing`, wait for image/bootstrap completion
-- Re-run pull from container:
-  - `docker exec -it <ollama_cid> ollama pull smollm2:135m`
-- Verify with: `docker exec -it <ollama_cid> ollama list`
+### Memcached issues
+- verify `clawbucket_memcached` is healthy (1/1)
 
 ---
 
-## 9) Security / production disclaimer
+## 10) Safety and production note
 
-This is intentionally simulation-first and **not production hardened**.
+This is simulation-first, not production-hardened.
 
-Current tradeoffs:
-- Docker socket mounted into app service
-- Memcached used as shared transient bus without auth
-- No strict distributed locks/consensus in app layer
+Current tradeoffs include:
+- Docker socket mount in app service
+- unauthenticated Memcached bus
+- lightweight coordination (not strict distributed consensus)
 
-For production, plan to:
-- split control-plane permissions
-- add authn/authz
-- isolate network paths
-- move to durable state store and stronger coordination primitives
+For production hardening: authn/authz, least-privilege control plane, stronger state/locking, and network isolation.
 
 ---
 
-## 10) What to track next (for eventual SKILL.md extraction)
+## 11) Unit flavor
 
-Potential sections for future `SKILL.md`:
-- **Purpose / constraints** (simulation-first)
-- **Service topology** (clawbucket, aggregator, memcached)
-- **Key contracts** (Memcached schema + API contracts)
-- **Election rules** (single manager/publisher rule)
-- **Game loop semantics** (publisher, players, scoring)
-- **UI invariants** (arm behavior, score styling)
-- **Operational playbook** (deploy, verify, recover)
-- **Known limitations** and hardening backlog
+Current prompt flavor supports a Starship Troopers-style military tone for generated chatter.
 
-This README is now the canonical snapshot of current behavior.
+Unit motto:
+
+> **Follow Me**
+
+---
+
+This README is the current canonical snapshot of behavior and architecture.
