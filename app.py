@@ -593,8 +593,11 @@ def generate_haiku_once():
     if not text:
         text = fetch_haiku_via_ollama()
         source = "ollama"
-    if text:
-        save_latest_haiku(text, source)
+    if not text:
+        # Ensure the dashboard always shows a haiku, even while AI backends warm up.
+        text = "Steel boots through mist\nPackets rally in cadence\nSwarm holds every line"
+        source = "fallback"
+    save_latest_haiku(text, source)
 
 
 def strip_ansi(text: str) -> str:
@@ -908,8 +911,17 @@ def api_rps_config_post():
 
 @app.get("/api/haiku")
 def api_haiku_get():
+    rec = load_latest_haiku()
+    if not rec:
+        # Graceful fallback so UI doesn't stay empty while generators warm up.
+        save_latest_haiku(
+            "Steel boots through mist\nPackets rally in cadence\nSwarm holds every line",
+            "fallback-api",
+        )
+        rec = load_latest_haiku()
+
     return jsonify({
-        "haiku": load_latest_haiku(),
+        "haiku": rec,
         "interval_seconds": HAIKU_INTERVAL_SECONDS,
     })
 
@@ -1024,10 +1036,12 @@ def index():
     .score.positive { color: #44d27a; }
     .score.negative { color: #ff6b6b; }
     .threewords {
-      margin-top: 6px;
-      font-size: .82rem;
-      color: #9db0e3;
-      min-height: 1.1rem;
+      margin-top: 8px;
+      font-size: 1.02rem;
+      font-weight: 700;
+      letter-spacing: .01em;
+      color: #d9e6ff;
+      min-height: 1.3rem;
     }
   </style>
 </head>
