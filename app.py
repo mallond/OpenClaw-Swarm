@@ -1349,6 +1349,37 @@ def api_arm_post():
     return jsonify({"ok": True, "event": event}), 201
 
 
+@app.post("/api/self_destruct")
+def api_self_destruct_post():
+    data = request.get_json(silent=True) or {}
+    service_name = (data.get("service") or "").strip()
+    task_id = (data.get("task_id") or "").strip()
+    if not service_name or not task_id:
+        return jsonify({"error": "service and task_id are required"}), 400
+
+    allowed = set(SWARM_SERVICES or [SERVICE_NAME])
+    if service_name not in allowed:
+        return jsonify({"error": f"service must be one of: {', '.join(sorted(allowed))}"}), 400
+
+    try:
+        for row in list_running_task_rows(service_name):
+            if row.get("id") == task_id:
+                cid = row.get("container_id")
+                if not cid:
+                    return jsonify({"error": "container id unavailable for task"}), 409
+                ctr = docker_client().containers.get(cid)
+                ctr.kill()
+                return jsonify({
+                    "ok": True,
+                    "service": service_name,
+                    "removed_task_id": task_id,
+                    "status": "self-destruct-triggered",
+                }), 202
+        return jsonify({"error": "task not found in service"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.post("/api/outage")
 def api_outage_post():
     data = request.get_json(silent=True) or {}
@@ -2059,6 +2090,25 @@ def index():
     }
 
     document.addEventListener('click', async (event) => {
+      const selfDestructBtn = event.target.closest('.selfdestruct-btn');
+      if (selfDestructBtn) {
+        const tile = selfDestructBtn.closest('.chip');
+        if (!tile) return;
+        const taskId = tile.dataset.taskId;
+        const serviceName = tile.dataset.service;
+        if (!taskId || !serviceName) return;
+        if (!confirm(`Self-destruct ${taskId.slice(0,12)} in ${serviceName}?`)) return;
+        selfDestructBtn.disabled = true;
+        fetch('/api/self_destruct', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service: serviceName, task_id: taskId }),
+        }).finally(() => {
+          setTimeout(loadState, 800);
+        });
+        return;
+      }
+
       const outageBtn = event.target.closest('.outage-btn');
       if (outageBtn) {
         const tile = outageBtn.closest('.chip');
@@ -2389,6 +2439,7 @@ def index():
             ${matchupLine}
             <button type="button" class="arm-btn">Arm</button>
             <button type="button" class="${pairBtnClass}" ${pairBtnDisabled}>${pairBtnText}</button>
+            <button type="button" class="selfdestruct-btn" style="margin-top:8px;margin-left:8px;border:1px solid #d65a5a;background:#7a2323;color:#fff;border-radius:8px;padding:6px 10px;font-weight:700;cursor:pointer;">Self-Destruct</button>
             ${r.is_manager ? '<button type="button" class="outage-btn" style="margin-top:8px;margin-left:8px;border:1px solid #b24a4a;background:#4a1d1d;color:#fff;border-radius:8px;padding:6px 10px;font-weight:700;cursor:pointer;">Outage</button>' : ''}
             <div class="threewords">${r.three_words || ''}</div>
           `;
