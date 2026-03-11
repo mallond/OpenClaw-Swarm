@@ -61,6 +61,7 @@ PICOCLAW_URL = os.environ.get("PICOCLAW_URL", "http://picoclaw:18790/v1/chat/com
 PICOCLAW_ENABLED = os.environ.get("PICOCLAW_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "smollm2:135m")
+DASHBOARD_BOT_LABEL = os.environ.get("DASHBOARD_BOT_LABEL", "").strip()
 THREE_WORDS_PREFIX = "clawbucket:picoclaw:threewords:"
 THREE_WORDS_SHARED_KEY = "clawbucket:picoclaw:threewords:latest"
 THREE_WORDS_INTERVAL_SECONDS = 30
@@ -1751,6 +1752,8 @@ def api_haiku_get():
 
 @app.get("/")
 def index():
+    safe_label = re.sub(r"[^A-Za-z0-9 _-]", "", DASHBOARD_BOT_LABEL).strip()
+    rack_badge = f" <span class=\"rack-badge\">{safe_label}</span>" if safe_label else ""
     return """
 <!doctype html>
 <html lang=\"en\">
@@ -1777,6 +1780,19 @@ def index():
     }
     .wrap { max-width: 980px; margin: 0 auto; padding: 24px 16px 40px; }
     h1 { margin: 0 0 8px; font-size: 2rem; }
+    .rack-badge {
+      display: inline-block;
+      vertical-align: middle;
+      margin-left: 10px;
+      font-size: .9rem;
+      font-weight: 800;
+      letter-spacing: .04em;
+      border-radius: 999px;
+      padding: 5px 10px;
+      border: 1px solid #6e8cff;
+      background: #243b8a;
+      color: #eaf0ff;
+    }
     .sub { color: var(--muted); margin-bottom: 18px; }
     .panel {
       background: color-mix(in srgb, var(--panel) 90%, black);
@@ -1906,7 +1922,7 @@ def index():
 </head>
 <body>
   <div class=\"wrap\">
-    <h1>🌍 Bob's World</h1>
+    <h1>🌍 Bob's World__RACK_BADGE__</h1>
     <div class=\"sub\">Swarm replicas as chicklets + quick scaling control.</div>
 
     <div id=\"swarmPanels\" style=\"display:grid; grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); gap:14px;\"></div>
@@ -2813,7 +2829,7 @@ def index():
   </script>
 </body>
 </html>
-"""
+""".replace("__RACK_BADGE__", rack_badge)
 
 
 if __name__ == "__main__":
