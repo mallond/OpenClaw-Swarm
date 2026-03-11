@@ -1401,10 +1401,22 @@ def api_swarms():
 def api_scale():
     data = request.get_json(silent=True) or {}
     replicas = data.get("replicas")
-    service_name = (data.get("service") or (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)).strip()
-    allowed = set(SWARM_SERVICES or [SERVICE_NAME])
+    requested_service = (data.get("service") or (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)).strip()
+    allowed = list(SWARM_SERVICES or [SERVICE_NAME])
+
+    # Accept either full stack service names (clawbucket_clawbucket-b)
+    # or short aliases (clawbucket-b) for operator convenience.
+    service_name = requested_service
     if service_name not in allowed:
-        return jsonify({"error": f"service must be one of: {', '.join(sorted(allowed))}"}), 400
+        alias_map = {}
+        for full in allowed:
+            alias_map[full] = full
+            if "_" in full:
+                alias_map[full.split("_", 1)[1]] = full
+        service_name = alias_map.get(requested_service, "")
+
+    if service_name not in allowed:
+        return jsonify({"error": f"service must be one of: {', '.join(sorted(set(allowed)))}"}), 400
     if not isinstance(replicas, int) or replicas < 1 or replicas > 20:
         return jsonify({"error": "replicas must be an integer between 1 and 20"}), 400
 
@@ -1682,17 +1694,7 @@ def api_revolt_post():
         if current <= 1:
             return jsonify({"error": "cannot revolt when source service has only 1 replica"}), 409
 
-        # Remove the specific revolting source task, then lower desired count by 1.
-        # This keeps the UI/ops semantics aligned: selected task defects and disappears.
-        source_cid = row.get("container_id")
-        if source_cid:
-            try:
-                client.containers.get(source_cid).kill()
-            except Exception:
-                pass
-        service.scale(current - 1)
-
-        append_revolt_event({
+        event = {
             "id": hashlib.md5(f"revolt-src:{time.time()}:{task_id}:{peer_resp.get('target_task_id','')}".encode("utf-8")).hexdigest()[:12],
             "at": datetime.now(timezone.utc).isoformat(),
             "source_task_id": task_id,
@@ -1701,7 +1703,27 @@ def api_revolt_post():
             "source_rack": DASHBOARD_BOT_LABEL or "unknown",
             "target_rack": "peer",
             "snapshot_id": local_snapshot.get("snapshot_id"),
-        })
+        }
+        # Persist source-side revolt event before touching task/container lifecycle.
+        append_revolt_event(event)
+
+        source_cid = row.get("container_id")
+
+        # Kill/scale after the response has been flushed so callers do not get
+        # socket resets when the selected source task happens to be handling the request.
+        def finalize_source_revolt(container_id: str | None, desired_after: int):
+            try:
+                time.sleep(0.4)
+                if container_id:
+                    try:
+                        client.containers.get(container_id).kill()
+                    except Exception:
+                        pass
+                service.scale(desired_after)
+            except Exception:
+                pass
+
+        Thread(target=finalize_source_revolt, args=(source_cid, current - 1), daemon=True).start()
 
         return jsonify({
             "ok": True,
@@ -1713,6 +1735,7 @@ def api_revolt_post():
             "source_snapshot_path": local_snapshot_path,
             "target_snapshot_path": peer_resp.get("snapshot_path"),
             "source_desired_replicas": current - 1,
+            "event": event,
             "status": "revolted",
         }), 202
     except Exception as e:
