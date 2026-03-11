@@ -329,15 +329,49 @@ chmod +x deploy-racks.sh
 ```
 
 This starts two nested Docker hosts:
-- `rack-1-dind` → stack `clawbucket` (BOT 1)
-- `rack-2-dind` → stack `clawbucket` (BOT 2)
+- `rack-1-dind` → stack `clawbucket` (**BOT 1 / Machine 1**)
+- `rack-2-dind` → stack `clawbucket` (**BOT 2 / Machine 2**)
+
+Dashboard identity labels (header badges):
+- **Machine Rack 1** (BOT 1)
+- **Machine Rack 2** (BOT 2)
 
 Host endpoints:
-- BOT 1 dashboard: `http://localhost:18080`
-- BOT 1 scoreboard: `http://localhost:18090/api/scoreboard`
-- BOT 2 dashboard: `http://localhost:28080`
-- BOT 2 scoreboard: `http://localhost:28090/api/scoreboard`
+- BOT 1 / Machine 1 dashboard: `http://localhost:18080`
+- BOT 1 / Machine 1 scoreboard: `http://localhost:18090/api/scoreboard`
+- BOT 2 / Machine 2 dashboard: `http://localhost:28080`
+- BOT 2 / Machine 2 scoreboard: `http://localhost:28090/api/scoreboard`
 
 Files:
 - `docker-compose.racks.yml` (boot both DinD racks)
 - `deploy-racks.sh` (swarm init + stack deploy per rack)
+
+## 13) Revolt: cross-rack task handoff
+
+**Revolt** is a per-task action that transfers live task state from one rack to the other.
+
+What gets transferred:
+- score
+- three-word text
+- arm state
+
+Flow:
+1. Click **Revolt** on a task tile in the source dashboard.
+2. Source rack snapshots state to disk under:
+   - `/tmp/clawbucket-revolt-snapshots/<snapshot_id>.json`
+3. Target rack receives and persists the snapshot, then restores the task from that file.
+
+APIs:
+- `POST /api/revolt` (source initiates handoff)
+- `POST /api/revolt/accept` (target accepts + restores)
+- `GET /api/revolt/events` (activity feed)
+
+UI visibility:
+- **Revolt Activity** panel shows handoff events.
+- Tile badges show handoff state:
+  - `FROM <source>` on target task
+  - `DEFECTED` on source task (if still present)
+
+Peer linkage in dual-rack deploy is injected automatically:
+- Rack 1 points to Rack 2 dashboard (`18080` ↔ `28080`)
+- Rack 2 points to Rack 1 dashboard (`28080` ↔ `18080`)
