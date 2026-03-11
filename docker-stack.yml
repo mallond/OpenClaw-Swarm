@@ -51,6 +51,7 @@ services:
       - PICOCLAW_ENABLED=0
       - OLLAMA_URL=http://ollama:11434/api/generate
       - OLLAMA_MODEL=smollm2:135m
+      - DASHBOARD_BOT_LABEL=${DASHBOARD_BOT_LABEL:-BOT}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     deploy:

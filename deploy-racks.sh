@@ -39,21 +39,17 @@ init_swarm_if_needed() {
 deploy_stack() {
   local rack="$1"
   local stack="$2"
+  local bot_label="$3"
 
   # Clean up old rack-specific stacks from earlier iterations.
   docker exec "$rack" docker stack rm clawbucket_rack1 >/dev/null 2>&1 || true
   docker exec "$rack" docker stack rm clawbucket_rack2 >/dev/null 2>&1 || true
 
-  echo "[${rack}] ensuring image ${IMAGE} is present"
-  if ! docker exec "$rack" docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    if ! docker exec "$rack" docker pull "$IMAGE" >/dev/null 2>&1; then
-      echo "[${rack}] remote image missing; building from local workspace"
-      docker exec "$rack" docker build -t "$IMAGE" /workspace/clawbucket >/dev/null
-    fi
-  fi
+  echo "[${rack}] building latest image ${IMAGE} from local workspace"
+  docker exec "$rack" docker build -t "$IMAGE" /workspace/clawbucket >/dev/null
 
-  echo "[${rack}] deploying stack ${stack}"
-  docker exec "$rack" docker stack deploy -c "$STACK_FILE" "$stack"
+  echo "[${rack}] deploying stack ${stack} (${bot_label})"
+  docker exec "$rack" sh -lc "DASHBOARD_BOT_LABEL='${bot_label}' docker stack deploy -c '$STACK_FILE' '$stack'"
 }
 
 status() {
@@ -74,8 +70,8 @@ for rack in rack-1-dind rack-2-dind; do
 done
 
 # Use the original stack name inside each isolated rack so service env names resolve.
-deploy_stack rack-1-dind clawbucket
-deploy_stack rack-2-dind clawbucket
+deploy_stack rack-1-dind clawbucket BOT-1
+deploy_stack rack-2-dind clawbucket BOT-2
 
 status rack-1-dind
 status rack-2-dind
