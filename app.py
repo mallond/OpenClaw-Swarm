@@ -10,6 +10,7 @@ import random
 import re
 import subprocess
 from urllib import request as urlrequest
+from pathlib import Path
 
 import docker
 from docker.errors import DockerException, NotFound
@@ -38,6 +39,8 @@ CHAT_KEY = "clawbucket:chat:messages"
 CHAT_LIMIT = 40
 ARM_EVENTS_KEY = "clawbucket:arm:events"
 ARM_EVENTS_LIMIT = 500
+REVOLT_EVENTS_KEY = "clawbucket:revolt:events"
+REVOLT_EVENTS_LIMIT = 300
 HEARTBEAT_INTERVAL_SECONDS = 10
 HEARTBEAT_TTL_SECONDS = 20
 RPS_STATE_KEY = "clawbucket:rps:state"
@@ -62,6 +65,8 @@ PICOCLAW_ENABLED = os.environ.get("PICOCLAW_ENABLED", "1").strip().lower() not i
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "smollm2:135m")
 DASHBOARD_BOT_LABEL = os.environ.get("DASHBOARD_BOT_LABEL", "").strip()
+PEER_DASHBOARD_URL = os.environ.get("PEER_DASHBOARD_URL", "").strip().rstrip("/")
+SNAPSHOT_DIR = os.environ.get("REVOLT_SNAPSHOT_DIR", "/tmp/clawbucket-revolt-snapshots").strip() or "/tmp/clawbucket-revolt-snapshots"
 THREE_WORDS_PREFIX = "clawbucket:picoclaw:threewords:"
 THREE_WORDS_SHARED_KEY = "clawbucket:picoclaw:threewords:latest"
 THREE_WORDS_INTERVAL_SECONDS = 30
@@ -210,6 +215,50 @@ def append_arm_event(task_id: str, bot_name: str, state: str):
         except Exception:
             pass
 
+    return event
+
+
+def load_revolt_events():
+    client = None
+    try:
+        client = memcache_client()
+        raw = client.get(REVOLT_EVENTS_KEY)
+        if not raw:
+            return []
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data[-REVOLT_EVENTS_LIMIT:]
+    except Exception:
+        pass
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
+    return []
+
+
+def append_revolt_event(event: dict):
+    if not isinstance(event, dict):
+        return None
+    events = load_revolt_events()
+    events.append(event)
+    events = events[-REVOLT_EVENTS_LIMIT:]
+    client = None
+    try:
+        client = memcache_client()
+        client.set(REVOLT_EVENTS_KEY, json.dumps(events), expire=86400)
+    except Exception:
+        return None
+    finally:
+        try:
+            if client:
+                client.close()
+        except Exception:
+            pass
     return event
 
 
@@ -1171,6 +1220,63 @@ def list_running_task_rows(service_name: str):
     return rows
 
 
+def task_arm_state(task_id: str) -> str:
+    for ev in reversed(load_arm_events()):
+        if ev.get("task_id") == task_id:
+            return "on" if str(ev.get("state", "")).lower() == "on" else "off"
+    return "off"
+
+
+def snapshot_task_state(task_id: str) -> dict:
+    return {
+        "score": get_task_score(task_id),
+        "three_words": load_task_three_words(task_id),
+        "arm_state": task_arm_state(task_id),
+    }
+
+
+def apply_task_state(task_id: str, state: dict):
+    if not isinstance(state, dict):
+        return
+    try:
+        set_task_score(task_id, int(state.get("score", 0)))
+    except Exception:
+        pass
+    three = str(state.get("three_words") or "").strip()
+    if three:
+        save_task_three_words(task_id, three)
+    arm_state = "on" if str(state.get("arm_state", "")).lower() == "on" else "off"
+    append_arm_event(task_id, generated_name(task_id), arm_state)
+
+
+def http_post_json(url: str, payload: dict, timeout: float = 8.0):
+    body = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8") if resp else "{}"
+        return json.loads(raw) if raw else {}
+
+
+def save_revolt_snapshot(snapshot: dict) -> str:
+    snap_id = str(snapshot.get("snapshot_id") or hashlib.md5(f"snap:{time.time()}:{random.random()}".encode("utf-8")).hexdigest()[:12])
+    snapshot["snapshot_id"] = snap_id
+    root = Path(SNAPSHOT_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{snap_id}.json"
+    path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
+def load_revolt_snapshot(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def is_duel_game_master() -> bool:
     primary = (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)
     return os.environ.get("SWARM_SERVICE", "") == primary and is_this_task_on_leader_manager()
@@ -1295,10 +1401,22 @@ def api_swarms():
 def api_scale():
     data = request.get_json(silent=True) or {}
     replicas = data.get("replicas")
-    service_name = (data.get("service") or (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)).strip()
-    allowed = set(SWARM_SERVICES or [SERVICE_NAME])
+    requested_service = (data.get("service") or (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)).strip()
+    allowed = list(SWARM_SERVICES or [SERVICE_NAME])
+
+    # Accept either full stack service names (clawbucket_clawbucket-b)
+    # or short aliases (clawbucket-b) for operator convenience.
+    service_name = requested_service
     if service_name not in allowed:
-        return jsonify({"error": f"service must be one of: {', '.join(sorted(allowed))}"}), 400
+        alias_map = {}
+        for full in allowed:
+            alias_map[full] = full
+            if "_" in full:
+                alias_map[full.split("_", 1)[1]] = full
+        service_name = alias_map.get(requested_service, "")
+
+    if service_name not in allowed:
+        return jsonify({"error": f"service must be one of: {', '.join(sorted(set(allowed)))}"}), 400
     if not isinstance(replicas, int) or replicas < 1 or replicas > 20:
         return jsonify({"error": "replicas must be an integer between 1 and 20"}), 400
 
@@ -1348,6 +1466,11 @@ def api_arm_post():
     if not event:
         return jsonify({"error": "invalid payload or memcached unavailable"}), 400
     return jsonify({"ok": True, "event": event}), 201
+
+
+@app.get("/api/revolt/events")
+def api_revolt_events_get():
+    return jsonify({"events": load_revolt_events(), "source": "memcached"})
 
 
 @app.post("/api/self_destruct")
@@ -1446,6 +1569,174 @@ def api_outage_post():
             "next_manager_slot": next_slot,
             "override_ttl_seconds": 300,
             "status": "outage-triggered",
+        }), 202
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/revolt/accept")
+def api_revolt_accept_post():
+    data = request.get_json(silent=True) or {}
+    service_name = (data.get("service") or "").strip()
+    state = data.get("state") or {}
+    source_task_id = (data.get("source_task_id") or "").strip()
+    snapshot_id = (data.get("snapshot_id") or "").strip()
+
+    allowed = set(SWARM_SERVICES or [SERVICE_NAME])
+    if service_name not in allowed:
+        return jsonify({"error": f"service must be one of: {', '.join(sorted(allowed))}"}), 400
+
+    try:
+        client = docker_client()
+        service = client.services.get(service_name)
+        before_rows = list_running_task_rows(service_name)
+        before_ids = {r.get("id") for r in before_rows if r.get("id")}
+        current = int((service.attrs.get("Spec", {}).get("Mode", {}).get("Replicated", {}) or {}).get("Replicas", len(before_rows)) or len(before_rows))
+        target = max(1, current + 1)
+        service.scale(target)
+
+        new_task_id = None
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            rows = list_running_task_rows(service_name)
+            for r in rows:
+                tid = r.get("id")
+                if tid and tid not in before_ids:
+                    new_task_id = tid
+                    break
+            if new_task_id:
+                break
+            time.sleep(0.4)
+
+        if not new_task_id:
+            return jsonify({"error": "timed out waiting for new target task"}), 504
+
+        snap = {
+            "snapshot_id": snapshot_id or None,
+            "from_task_id": source_task_id,
+            "to_task_id": new_task_id,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "state": state,
+            "rack": DASHBOARD_BOT_LABEL,
+        }
+        snap_path = save_revolt_snapshot(snap)
+        restored = load_revolt_snapshot(snap_path).get("state", {})
+        apply_task_state(new_task_id, restored)
+        ev = {
+            "id": hashlib.md5(f"revolt:{time.time()}:{source_task_id}:{new_task_id}".encode("utf-8")).hexdigest()[:12],
+            "at": datetime.now(timezone.utc).isoformat(),
+            "source_task_id": source_task_id,
+            "target_task_id": new_task_id,
+            "service": service_name,
+            "source_rack": str(data.get("from_rack") or "unknown"),
+            "target_rack": DASHBOARD_BOT_LABEL or "unknown",
+            "snapshot_id": (load_revolt_snapshot(snap_path).get("snapshot_id") or snapshot_id),
+        }
+        append_revolt_event(ev)
+        return jsonify({
+            "ok": True,
+            "service": service_name,
+            "target_task_id": new_task_id,
+            "from_task_id": source_task_id,
+            "snapshot_id": ev["snapshot_id"],
+            "snapshot_path": snap_path,
+            "event": ev,
+            "status": "accepted",
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/api/revolt")
+def api_revolt_post():
+    data = request.get_json(silent=True) or {}
+    service_name = (data.get("service") or "").strip()
+    task_id = (data.get("task_id") or "").strip()
+    if not service_name or not task_id:
+        return jsonify({"error": "service and task_id are required"}), 400
+
+    if not PEER_DASHBOARD_URL:
+        return jsonify({"error": "peer dashboard is not configured for revolt"}), 409
+
+    allowed = set(SWARM_SERVICES or [SERVICE_NAME])
+    if service_name not in allowed:
+        return jsonify({"error": f"service must be one of: {', '.join(sorted(allowed))}"}), 400
+
+    try:
+        row = next((r for r in list_running_task_rows(service_name) if r.get("id") == task_id), None)
+        if not row:
+            return jsonify({"error": "task not found in service"}), 404
+
+        state = snapshot_task_state(task_id)
+        local_snapshot = {
+            "snapshot_id": hashlib.md5(f"revolt:{service_name}:{task_id}:{time.time()}".encode("utf-8")).hexdigest()[:12],
+            "service": service_name,
+            "source_task_id": task_id,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "rack": DASHBOARD_BOT_LABEL,
+            "state": state,
+        }
+        local_snapshot_path = save_revolt_snapshot(local_snapshot)
+        peer_payload = {
+            "service": service_name,
+            "source_task_id": task_id,
+            "snapshot_id": local_snapshot.get("snapshot_id"),
+            "state": state,
+            "from_rack": DASHBOARD_BOT_LABEL,
+        }
+        peer_resp = http_post_json(f"{PEER_DASHBOARD_URL}/api/revolt/accept", peer_payload, timeout=10.0)
+        if not isinstance(peer_resp, dict) or not peer_resp.get("ok"):
+            return jsonify({"error": "peer rack rejected revolt", "peer": peer_resp}), 502
+
+        client = docker_client()
+        service = client.services.get(service_name)
+        current = int((service.attrs.get("Spec", {}).get("Mode", {}).get("Replicated", {}) or {}).get("Replicas", 0) or 0)
+        if current <= 1:
+            return jsonify({"error": "cannot revolt when source service has only 1 replica"}), 409
+
+        event = {
+            "id": hashlib.md5(f"revolt-src:{time.time()}:{task_id}:{peer_resp.get('target_task_id','')}".encode("utf-8")).hexdigest()[:12],
+            "at": datetime.now(timezone.utc).isoformat(),
+            "source_task_id": task_id,
+            "target_task_id": peer_resp.get("target_task_id"),
+            "service": service_name,
+            "source_rack": DASHBOARD_BOT_LABEL or "unknown",
+            "target_rack": "peer",
+            "snapshot_id": local_snapshot.get("snapshot_id"),
+        }
+        # Persist source-side revolt event before touching task/container lifecycle.
+        append_revolt_event(event)
+
+        source_cid = row.get("container_id")
+
+        # Kill/scale after the response has been flushed so callers do not get
+        # socket resets when the selected source task happens to be handling the request.
+        def finalize_source_revolt(container_id: str | None, desired_after: int):
+            try:
+                time.sleep(0.4)
+                if container_id:
+                    try:
+                        client.containers.get(container_id).kill()
+                    except Exception:
+                        pass
+                service.scale(desired_after)
+            except Exception:
+                pass
+
+        Thread(target=finalize_source_revolt, args=(source_cid, current - 1), daemon=True).start()
+
+        return jsonify({
+            "ok": True,
+            "service": service_name,
+            "source_task_id": task_id,
+            "target_task_id": peer_resp.get("target_task_id"),
+            "peer": PEER_DASHBOARD_URL,
+            "snapshot_id": local_snapshot.get("snapshot_id"),
+            "source_snapshot_path": local_snapshot_path,
+            "target_snapshot_path": peer_resp.get("snapshot_path"),
+            "source_desired_replicas": current - 1,
+            "event": event,
+            "status": "revolted",
         }), 202
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -2016,6 +2307,11 @@ def index():
     </div>
 
     <div class=\"panel\" style=\"margin-top:16px\">
+      <div class=\"row\"><strong>Revolt Activity</strong></div>
+      <div id=\"revoltFeed\" style=\"margin-top:10px; display:grid; gap:6px; max-height:140px; overflow:auto;\"></div>
+    </div>
+
+    <div class=\"panel\" style=\"margin-top:16px\">
       <div class=\"row\">
         <strong>Container Conversation (Memcached simulation)</strong>
       </div>
@@ -2035,6 +2331,7 @@ def index():
     const haikuBox = document.getElementById('haikuBox');
     const chatMsg = document.getElementById('chatMsg');
     const chatFeed = document.getElementById('chatFeed');
+    const revoltFeed = document.getElementById('revoltFeed');
     const rpsInterval = document.getElementById('rpsInterval');
     const rpsApply = document.getElementById('rpsApply');
     const rpsMsg = document.getElementById('rpsMsg');
@@ -2202,6 +2499,33 @@ def index():
           gameMsg.textContent = e.message;
         } finally {
           pairBtn.disabled = false;
+        }
+        return;
+      }
+
+      const revoltBtn = event.target.closest('.revolt-btn');
+      if (revoltBtn) {
+        const tile = revoltBtn.closest('.chip');
+        if (!tile) return;
+        const taskId = tile.dataset.taskId;
+        const serviceName = tile.dataset.service;
+        if (!taskId || !serviceName) return;
+        if (!confirm(`Revolt ${taskId.slice(0,12)} to the other rack?`)) return;
+        revoltBtn.disabled = true;
+        try {
+          const res = await fetch('/api/revolt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service: serviceName, task_id: taskId }),
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.error || 'Revolt failed');
+          setTimeout(loadState, 1200);
+          setTimeout(loadRevolt, 1200);
+        } catch (e) {
+          alert(`Revolt failed: ${e.message}`);
+        } finally {
+          revoltBtn.disabled = false;
         }
         return;
       }
@@ -2394,6 +2718,13 @@ def index():
     function renderSwarms(swarms) {
       const toggles = loadTileToggles();
       const pMap = pairMap();
+      const revoltEvents = (window.__revoltEvents || []).slice(-80);
+      const revoltToMap = {};
+      const revoltFromMap = {};
+      for (const ev of revoltEvents) {
+        if (ev.target_task_id) revoltToMap[ev.target_task_id] = ev;
+        if (ev.source_task_id) revoltFromMap[ev.source_task_id] = ev;
+      }
       swarmPanels.innerHTML = '';
       for (const s of swarms || []) {
         const panel = document.createElement('div');
@@ -2427,6 +2758,8 @@ def index():
 
         const sortedReplicas = [...(s.replicas || [])].sort((a,b)=> (b.score||0)-(a.score||0) || (a.slot||0)-(b.slot||0));
         for (const r of sortedReplicas) {
+          // Hide source task tile after revolt so it is treated as removed.
+          if (revoltFromMap[r.id]) continue;
           const el = document.createElement('div');
           const isOn = toggles[r.id] === true;
           el.className = `chip ${r.is_manager ? 'manager' : ''}`;
@@ -2445,8 +2778,13 @@ def index():
           const matchupLine = activePair
             ? `<p><strong>Matchup:</strong> vs ${taskLabel(opponentId)}</p>`
             : `<p><strong>Matchup:</strong> none</p>`;
+          const revoltIn = revoltToMap[r.id];
+          const revoltOut = revoltFromMap[r.id];
+          const revoltBadge = revoltIn
+            ? `<span class="lock-badge locked">FROM ${String(revoltIn.source_task_id || '').slice(0, 8)}</span>`
+            : (revoltOut ? `<span class="lock-badge">DEFECTED</span>` : '');
           el.innerHTML = `
-            <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}
+            <span class="status">OFF</span>${r.is_manager ? '<span class="manager-badge">MANAGER</span>' : ''}${revoltBadge}
             <h3>${r.name}</h3>
             ${r.is_manager ? '' : `<div class="score ${scoreClass}">${scoreText}</div>`}
             <p><strong>Slot:</strong> ${r.slot}</p>
@@ -2455,6 +2793,7 @@ def index():
             ${matchupLine}
             <button type="button" class="arm-btn">Arm</button>
             <button type="button" class="${pairBtnClass}" ${pairBtnDisabled}>${pairBtnText}</button>
+            <button type="button" class="revolt-btn" style="margin-top:8px;margin-left:8px;border:1px solid #c98b2f;background:#6b4a1a;color:#fff;border-radius:8px;padding:6px 10px;font-weight:700;cursor:pointer;">Revolt</button>
             <button type="button" class="selfdestruct-btn" style="margin-top:8px;margin-left:8px;border:1px solid #d65a5a;background:#7a2323;color:#fff;border-radius:8px;padding:6px 10px;font-weight:700;cursor:pointer;">Self-Destruct</button>
             ${r.is_manager ? '<button type="button" class="outage-btn" style="margin-top:8px;margin-left:8px;border:1px solid #b24a4a;background:#4a1d1d;color:#fff;border-radius:8px;padding:6px 10px;font-weight:700;cursor:pointer;">Outage</button>' : ''}
             <div class="threewords">${r.three_words || ''}</div>
@@ -2494,6 +2833,34 @@ def index():
         renderChat(data.messages || []);
       } catch (e) {
         chatMsg.textContent = e.message;
+      }
+    }
+
+    function renderRevolt(events) {
+      const rows = (events || []).slice(-12).reverse();
+      window.__revoltEvents = rows;
+      revoltFeed.innerHTML = '';
+      for (const ev of rows) {
+        const row = document.createElement('div');
+        row.className = 'meta';
+        row.style.padding = '6px 8px';
+        row.style.border = '1px solid #2b3a67';
+        row.style.borderRadius = '8px';
+        row.style.background = '#0f1730';
+        row.textContent = `[${(ev.at || '').slice(11, 19)}] ${String(ev.source_rack || 'rack').trim()} ${String(ev.source_task_id || '').slice(0, 8)} → ${String(ev.target_rack || 'rack').trim()} ${String(ev.target_task_id || '').slice(0, 8)}`;
+        revoltFeed.appendChild(row);
+      }
+      if (!rows.length) revoltFeed.innerHTML = '<div class="meta">No revolt events yet.</div>';
+    }
+
+    async function loadRevolt() {
+      try {
+        const res = await fetch('/api/revolt/events');
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Revolt feed unavailable');
+        renderRevolt(data.events || []);
+      } catch {
+        // keep previous feed
       }
     }
 
@@ -2817,12 +3184,14 @@ def index():
     loadGame();
     loadState();
     loadChat();
+    loadRevolt();
     loadHaiku();
     loadRps();
     loadDuel();
     setInterval(loadGame, 3000);
     setInterval(loadState, 3000);
     setInterval(loadChat, 4000);
+    setInterval(loadRevolt, 3000);
     setInterval(loadHaiku, 5000);
     setInterval(loadRps, 3000);
     setInterval(loadDuel, 3000);
