@@ -10,6 +10,7 @@ import random
 import re
 import subprocess
 from urllib import request as urlrequest
+from pathlib import Path
 
 import docker
 from docker.errors import DockerException, NotFound
@@ -63,6 +64,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434/api/generate")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "smollm2:135m")
 DASHBOARD_BOT_LABEL = os.environ.get("DASHBOARD_BOT_LABEL", "").strip()
 PEER_DASHBOARD_URL = os.environ.get("PEER_DASHBOARD_URL", "").strip().rstrip("/")
+SNAPSHOT_DIR = os.environ.get("REVOLT_SNAPSHOT_DIR", "/tmp/clawbucket-revolt-snapshots").strip() or "/tmp/clawbucket-revolt-snapshots"
 THREE_WORDS_PREFIX = "clawbucket:picoclaw:threewords:"
 THREE_WORDS_SHARED_KEY = "clawbucket:picoclaw:threewords:latest"
 THREE_WORDS_INTERVAL_SECONDS = 30
@@ -1209,6 +1211,26 @@ def http_post_json(url: str, payload: dict, timeout: float = 8.0):
         return json.loads(raw) if raw else {}
 
 
+def save_revolt_snapshot(snapshot: dict) -> str:
+    snap_id = str(snapshot.get("snapshot_id") or hashlib.md5(f"snap:{time.time()}:{random.random()}".encode("utf-8")).hexdigest()[:12])
+    snapshot["snapshot_id"] = snap_id
+    root = Path(SNAPSHOT_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{snap_id}.json"
+    path.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+    return str(path)
+
+
+def load_revolt_snapshot(path: str) -> dict:
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
 def is_duel_game_master() -> bool:
     primary = (SWARM_SERVICES[0] if SWARM_SERVICES else SERVICE_NAME)
     return os.environ.get("SWARM_SERVICE", "") == primary and is_this_task_on_leader_manager()
@@ -1495,6 +1517,7 @@ def api_revolt_accept_post():
     service_name = (data.get("service") or "").strip()
     state = data.get("state") or {}
     source_task_id = (data.get("source_task_id") or "").strip()
+    snapshot_id = (data.get("snapshot_id") or "").strip()
 
     allowed = set(SWARM_SERVICES or [SERVICE_NAME])
     if service_name not in allowed:
@@ -1525,12 +1548,24 @@ def api_revolt_accept_post():
         if not new_task_id:
             return jsonify({"error": "timed out waiting for new target task"}), 504
 
-        apply_task_state(new_task_id, state)
+        snap = {
+            "snapshot_id": snapshot_id or None,
+            "from_task_id": source_task_id,
+            "to_task_id": new_task_id,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "state": state,
+            "rack": DASHBOARD_BOT_LABEL,
+        }
+        snap_path = save_revolt_snapshot(snap)
+        restored = load_revolt_snapshot(snap_path).get("state", {})
+        apply_task_state(new_task_id, restored)
         return jsonify({
             "ok": True,
             "service": service_name,
             "target_task_id": new_task_id,
             "from_task_id": source_task_id,
+            "snapshot_id": (load_revolt_snapshot(snap_path).get("snapshot_id") or snapshot_id),
+            "snapshot_path": snap_path,
             "status": "accepted",
         }), 201
     except Exception as e:
@@ -1558,9 +1593,19 @@ def api_revolt_post():
             return jsonify({"error": "task not found in service"}), 404
 
         state = snapshot_task_state(task_id)
+        local_snapshot = {
+            "snapshot_id": hashlib.md5(f"revolt:{service_name}:{task_id}:{time.time()}".encode("utf-8")).hexdigest()[:12],
+            "service": service_name,
+            "source_task_id": task_id,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "rack": DASHBOARD_BOT_LABEL,
+            "state": state,
+        }
+        local_snapshot_path = save_revolt_snapshot(local_snapshot)
         peer_payload = {
             "service": service_name,
             "source_task_id": task_id,
+            "snapshot_id": local_snapshot.get("snapshot_id"),
             "state": state,
             "from_rack": DASHBOARD_BOT_LABEL,
         }
@@ -1581,6 +1626,9 @@ def api_revolt_post():
             "source_task_id": task_id,
             "target_task_id": peer_resp.get("target_task_id"),
             "peer": PEER_DASHBOARD_URL,
+            "snapshot_id": local_snapshot.get("snapshot_id"),
+            "source_snapshot_path": local_snapshot_path,
+            "target_snapshot_path": peer_resp.get("snapshot_path"),
             "source_desired_replicas": current - 1,
             "status": "revolted",
         }), 202
